@@ -1,0 +1,300 @@
+import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { Suspense, lazy, useEffect } from 'react'
+import { toast } from 'sonner'
+import SmartRouteSkeleton from '../shared/components/skeletons/SmartRouteSkeleton'
+import {
+  NATIVE_LAST_ROUTE_AT_KEY,
+  NATIVE_LAST_ROUTE_KEY,
+  resolveCurrentAppHomeRoute,
+  syncActiveModule,
+} from '../shared/utils/activeModule.js'
+import lazyWithRetry from '../shared/utils/lazyWithRetry.js'
+
+// Lazy load the Food service module (Quick-spicy app)
+const FoodApp = lazyWithRetry(() => import('../modules/Food/routes'))
+const TaxiApp = lazyWithRetry(() => import('../modules/Taxi/TaxiApp'))
+const AuthApp = lazyWithRetry(() => import('../modules/auth/routes'))
+const GlobalTerms = lazyWithRetry(() => import('../modules/Food/pages/user/profile/Terms'))
+const GlobalPrivacy = lazyWithRetry(() => import('../modules/Food/pages/user/profile/Privacy'))
+const GlobalRefund = lazyWithRetry(() => import('../modules/Food/pages/user/profile/Refund'))
+const GlobalShipping = lazyWithRetry(() => import('../modules/Food/pages/user/profile/Shipping'))
+const GlobalCancellation = lazyWithRetry(() => import('../modules/Food/pages/user/profile/Cancellation'))
+const GlobalAbout = lazyWithRetry(() => import('../modules/Food/pages/user/profile/About'))
+
+const GlobalPolicyViewer = () => {
+  const { key } = useParams()
+  const lowerKey = (key || '').toLowerCase()
+  if (lowerKey.includes('terms')) {
+    return <GlobalTerms keyName={key} />
+  }
+  return <GlobalPrivacy keyName={key} />
+}
+
+const PageLoader = () => <SmartRouteSkeleton />
+
+// Switching between Food / Taxi / Global admin: keep the screen calm (no skeleton flash) while the next admin chunk mounts.
+const AdminSwitchFallback = () => <div className="min-h-screen bg-neutral-100" />
+
+const FoodAppWrapper = () => {
+  const location = useLocation()
+  const vertical = new URLSearchParams(location.search).get('vertical')
+
+  // Taxi lives under /taxi/* only — never embed it on /food/user.
+  if (
+    location.pathname.replace(/\/$/, '') === '/food/user' &&
+    vertical === 'taxi'
+  ) {
+    return <Navigate to="/taxi/user" replace />
+  }
+
+  return (
+    <Suspense fallback={<PageLoader />}>
+      <FoodApp />
+    </Suspense>
+  )
+}
+
+const TaxiAppWrapper = () => {
+  const { pathname } = useLocation()
+  const isAdmin = pathname.startsWith('/taxi/admin')
+  return (
+    <Suspense fallback={isAdmin ? <AdminSwitchFallback /> : <PageLoader />}>
+      <TaxiApp />
+    </Suspense>
+  )
+}
+
+const RedirectToFood = () => {
+  const location = useLocation()
+  return <Navigate to={`/food${location.pathname}${location.search}`} replace />
+}
+
+const RedirectToFoodUser = () => {
+  const location = useLocation()
+  return <Navigate to={`/food/user${location.pathname}${location.search}`} replace />
+}
+
+const RedirectToTaxiDriver = () => {
+  const location = useLocation()
+  const subpath = location.pathname.replace(/^\/driver/, '') || ''
+  return <Navigate to={`/taxi/driver${subpath}${location.search}`} replace />
+}
+
+const RedirectToTaxiOwner = () => {
+  const location = useLocation()
+  const subpath = location.pathname.replace(/^\/owner/, '') || ''
+  return <Navigate to={`/taxi/owner${subpath}${location.search}`} replace />
+}
+
+const LandingPage = lazyWithRetry(() => import('../modules/Taxi/modules/shared/pages/LandingPage'))
+const AdminRouter = lazyWithRetry(() => import('../modules/Food/components/admin/AdminRouter'))
+
+const RootLandingOrAppRedirect = () => {
+  const home = resolveCurrentAppHomeRoute('/')
+  if (home && home !== '/') {
+    return <Navigate to={home} replace />
+  }
+  return (
+    <Suspense fallback={<PageLoader />}>
+      <LandingPage />
+    </Suspense>
+  )
+}
+
+const SmartFallbackRedirect = () => {
+  const location = useLocation()
+  const pathname = location.pathname.toLowerCase()
+
+  if (pathname.startsWith('/taxi/driver') || pathname.startsWith('/driver')) {
+    return <Navigate to="/taxi/driver/home" replace />
+  }
+  if (pathname.startsWith('/taxi/owner') || pathname.startsWith('/owner')) {
+    return <Navigate to="/taxi/owner/dashboard" replace />
+  }
+  if (pathname.startsWith('/taxi')) {
+    return <Navigate to="/taxi/user" replace />
+  }
+  if (pathname.startsWith('/admin')) {
+    return <Navigate to="/admin" replace />
+  }
+  if (pathname.startsWith('/food/delivery') || pathname.startsWith('/delivery')) {
+    return <Navigate to="/food/delivery" replace />
+  }
+  if (pathname.startsWith('/food/restaurant') || pathname.startsWith('/restaurant')) {
+    return <Navigate to="/food/restaurant" replace />
+  }
+  if (pathname.startsWith('/food/user') || pathname.startsWith('/food')) {
+    return <Navigate to="/food/user" replace />
+  }
+  if (pathname.startsWith('/login') || pathname.startsWith('/auth')) {
+    return <Navigate to="/login" replace />
+  }
+
+  const home = resolveCurrentAppHomeRoute(pathname)
+  return <Navigate to={home || '/food/user'} replace />
+}
+
+const AppRoutes = () => {
+  const location = useLocation()
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    const handleGlobalAuthStale = (event) => {
+      const currentPath = String(window.location.pathname || '').toLowerCase()
+      // Do not trigger session expired error or forced login redirect if already on login, auth, terms, or privacy page
+      if (
+        currentPath === '/login' ||
+        currentPath.includes('/auth/') ||
+        currentPath.includes('/login') ||
+        currentPath.includes('/onboarding') ||
+        currentPath.includes('/pending-verification') ||
+        currentPath.includes('/terms') ||
+        currentPath.includes('/privacy') ||
+        currentPath === '/refund' ||
+        currentPath === '/shipping' ||
+        currentPath === '/cancellation' ||
+        currentPath === '/about'
+      ) {
+        return
+      }
+
+      const role = String(event.detail?.role || 'user').toLowerCase()
+      if (role === 'admin') {
+        navigate('/admin/login', { replace: true })
+      } else if (role === 'delivery') {
+        navigate('/food/delivery/login', { replace: true })
+      } else if (role === 'restaurant') {
+        navigate('/food/restaurant/login', { replace: true })
+      } else if (['driver', 'owner', 'bus_driver', 'service_center', 'service_center_staff'].includes(role)) {
+        navigate(role === 'owner' ? '/taxi/owner/login' : '/taxi/driver/login', { replace: true })
+      } else {
+        localStorage.removeItem('token')
+        localStorage.removeItem('userToken')
+        localStorage.removeItem('user_accessToken')
+        localStorage.removeItem('user_authenticated')
+        localStorage.removeItem('user_user')
+        localStorage.removeItem('userInfo')
+        toast.error('Session expired. Please log in again.')
+        navigate((currentPath.startsWith('/taxi') || String(window.location.hash || '').startsWith('#/taxi')) ? '/login' : '/food/user/auth/login', { replace: true })
+      }
+    }
+
+    window.addEventListener('app:auth-stale', handleGlobalAuthStale)
+    return () => window.removeEventListener('app:auth-stale', handleGlobalAuthStale)
+  }, [navigate])
+
+  useEffect(() => {
+    syncActiveModule(location.pathname)
+  }, [location.pathname])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const protocol = String(window.location?.protocol || '').toLowerCase()
+    const userAgent = String(window.navigator?.userAgent || '').toLowerCase()
+    const isNativeLikeShell =
+      Boolean(window.flutter_inappwebview) ||
+      Boolean(window.ReactNativeWebView) ||
+      protocol === 'file:' ||
+      userAgent.includes(' wv') ||
+      userAgent.includes('; wv')
+
+    if (!isNativeLikeShell) return
+
+    const route = `${location.pathname || ''}${location.search || ''}`
+
+    // Do NOT persist transient ride-flow routes that rely on React Router state.
+    // If the app reopens on these pages the state is lost, showing stale data.
+    const TRANSIENT_ROUTE_SEGMENTS = [
+      '/ride/select-vehicle',
+      '/ride/select-location',
+      '/ride/searching',
+      '/ride/tracking',
+      '/ride/complete',
+      '/ride/chat',
+      '/parcel/searching',
+      '/parcel/tracking',
+      '/parcel/details',
+      '/parcel/contacts',
+      '/intercity/details',
+      '/intercity/confirm',
+      '/rental/vehicle',
+      '/rental/schedule',
+      '/rental/kyc',
+      '/rental/deposit',
+      '/rental/confirmed',
+    ]
+    const isTransient = TRANSIENT_ROUTE_SEGMENTS.some(seg => route.includes(seg))
+    if (isTransient) return
+
+    if (
+      route.startsWith('/taxi/') ||
+      route.startsWith('/food/') ||
+      route.startsWith('/admin') ||
+      route.startsWith('/delivery') ||
+      route.startsWith('/restaurant') ||
+      route.startsWith('/driver') ||
+      route.startsWith('/owner')
+    ) {
+      localStorage.setItem(NATIVE_LAST_ROUTE_KEY, route)
+      localStorage.setItem(NATIVE_LAST_ROUTE_AT_KEY, String(Date.now()))
+    }
+  }, [location.pathname, location.search])
+
+  // Leaving the app with the Home button: remember when, so a relaunch soon after reopens this page.
+  useEffect(() => {
+    const markLeftAt = () => {
+      if (document.visibilityState === 'hidden') {
+        try {
+          if (localStorage.getItem(NATIVE_LAST_ROUTE_KEY)) {
+            localStorage.setItem(NATIVE_LAST_ROUTE_AT_KEY, String(Date.now()))
+          }
+        } catch { /* ignore storage errors */ }
+      }
+    }
+    document.addEventListener('visibilitychange', markLeftAt)
+    window.addEventListener('pagehide', markLeftAt)
+    return () => {
+      document.removeEventListener('visibilitychange', markLeftAt)
+      window.removeEventListener('pagehide', markLeftAt)
+    }
+  }, [])
+
+  return (
+    <Routes>
+      <Route path="/" element={<RootLandingOrAppRedirect />} />
+      <Route path="/landing" element={<Suspense fallback={<PageLoader />}><LandingPage /></Suspense>} />
+      <Route path="/login/*" element={<Suspense fallback={<PageLoader />}><AuthApp /></Suspense>} />
+      <Route path="/terms" element={<Suspense fallback={<PageLoader />}><GlobalTerms /></Suspense>} />
+      <Route path="/privacy" element={<Suspense fallback={<PageLoader />}><GlobalPrivacy /></Suspense>} />
+      <Route path="/food/pages/:key" element={<Suspense fallback={<PageLoader />}><GlobalPolicyViewer /></Suspense>} />
+      <Route path="/refund" element={<Suspense fallback={<PageLoader />}><GlobalRefund /></Suspense>} />
+      <Route path="/shipping" element={<Suspense fallback={<PageLoader />}><GlobalShipping /></Suspense>} />
+      <Route path="/cancellation" element={<Suspense fallback={<PageLoader />}><GlobalCancellation /></Suspense>} />
+      <Route path="/about" element={<Suspense fallback={<PageLoader />}><GlobalAbout /></Suspense>} />
+      <Route path="/food/*" element={<FoodAppWrapper />} />
+      <Route path="/taxi/*" element={<TaxiAppWrapper />} />
+      <Route
+        path="/admin/*"
+        element={
+          <Suspense fallback={<AdminSwitchFallback />}>
+            <AdminRouter />
+          </Suspense>
+        }
+      />
+      <Route path="/user/*" element={<RedirectToFood />} />
+      <Route path="/restaurant/*" element={<RedirectToFood />} />
+      <Route path="/restaurants/*" element={<RedirectToFoodUser />} />
+      <Route path="/delivery/*" element={<RedirectToFood />} />
+      <Route path="/driver/*" element={<RedirectToTaxiDriver />} />
+      <Route path="/owner/*" element={<RedirectToTaxiOwner />} />
+      <Route path="/usermain/*" element={<RedirectToFood />} />
+      <Route path="/profile/*" element={<RedirectToFoodUser />} />
+      <Route path="/cart/*" element={<RedirectToFoodUser />} />
+      <Route path="/orders/*" element={<RedirectToFoodUser />} />
+      <Route path="*" element={<SmartFallbackRedirect />} />
+    </Routes>
+  )
+}
+
+export default AppRoutes

@@ -1,0 +1,213 @@
+import { FoodPageContent } from '../models/pageContent.model.js';
+import { ValidationError } from '../../../../core/auth/errors.js';
+
+const normalizeKey = (key) => String(key || '').trim().toLowerCase();
+
+const decodeHtmlEntities = (value) => {
+    if (value === null || value === undefined) return value;
+    let s = String(value);
+    if (!s.includes('&')) return s;
+    return s
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'");
+};
+
+const normalizeLegalForResponse = (legal) => {
+    if (!legal || typeof legal !== 'object') return legal;
+    const title = legal.title ?? '';
+    const content = decodeHtmlEntities(legal.content ?? '');
+    return { ...legal, title, content };
+};
+
+const normalizeAboutForResponse = (about) => {
+    if (!about || typeof about !== 'object') return about;
+    return {
+        ...about,
+        appName: decodeHtmlEntities(about.appName ?? ''),
+        version: decodeHtmlEntities(about.version ?? ''),
+        description: decodeHtmlEntities(about.description ?? ''),
+        logo: decodeHtmlEntities(about.logo ?? '')
+    };
+};
+
+const DEFAULT_PAGES = {
+    terms: {
+        title: 'User Terms and Conditions',
+        content: `<h2>User Terms and Conditions</h2><p>Welcome to Eqosy. By accessing or using our application, website, and services, you agree to be bound by these Terms and Conditions.</p><h3>1. Account Registration</h3><p>You must provide accurate information when registering an account. You are responsible for maintaining the confidentiality of your account credentials.</p><h3>2. Platform Services</h3><p>Eqosy provides an on-demand marketplace connecting users with restaurant vendors, delivery partners, and taxi drivers.</p><h3>3. Payments and Cancellation</h3><p>Payments made through the platform are processed securely. Cancellations and refunds are governed by our active cancellation and refund policies.</p><h3>4. User Conduct</h3><p>Users must not engage in fraudulent activities, abuse referral bonuses, or misuse system services.</p>`
+    },
+    'restaurant-terms': {
+        title: 'Restaurant Partner Terms and Conditions',
+        content: `<h2>Restaurant Partner Terms and Conditions</h2><p>These terms govern the relationship between Eqosy and merchant restaurant partners.</p><h3>1. Merchant Onboarding & Licensing</h3><p>Merchants must maintain valid food safety licenses (FSSAI/Local Authority), trade licenses, and accurate tax documentation at all times.</p><h3>2. Order Processing & Food Quality</h3><p>Restaurants agree to prepare accepted orders in accordance with safety, hygiene, and timing guidelines. All packaging must adhere to hygiene standards.</p><h3>3. Commissions & Payout Settlements</h3><p>Platform commissions will be deducted automatically based on agreed commission structure. Net earnings are settled directly to merchant bank accounts per the configured payment cycle.</p><h3>4. Menu & Price Compliance</h3><p>Merchants must keep menu items, prices, and store operational hours updated in real time. Price inflation beyond platform policy is strictly prohibited.</p>`
+    },
+    'delivery-terms': {
+        title: 'Delivery Partner Terms and Conditions',
+        content: `<h2>Delivery Partner Terms and Conditions</h2><p>These terms apply to all registered delivery fleet partners operating on the Eqosy platform.</p><h3>1. Partner Eligibility & Documentation</h3><p>Delivery partners must hold a valid driving license, active vehicle registration (RC), and necessary vehicle insurance.</p><h3>2. Delivery Code of Conduct</h3><p>Partners are expected to handle orders safely, follow traffic regulations, maintain hygiene standards, and interact politely with customers and restaurant staff.</p><h3>3. Payouts, Earnings & Tips</h3><p>Earnings, delivery fees, and 100% of customer tips are credited to the delivery partner's wallet upon order completion.</p>`
+    },
+    'driver-terms': {
+        title: 'Driver Partner Terms and Conditions',
+        content: `<h2>Driver Partner Terms and Conditions</h2><p>These terms govern driver partners operating cab, auto, bike, and intercity transit services on the Eqosy Taxi platform.</p><h3>1. Vehicle Standards</h3><p>Drivers must maintain roadworthy, clean, and insured vehicles with valid commercial or private permits as applicable.</p><h3>2. Safety & Standards</h3><p>Drivers must strictly comply with local speed limits, navigation routes, and safety protocols.</p><h3>3. Fare Bidding & Policy</h3><p>Ride fares and bid percentages must stay within configured admin policy ranges. Tariff manipulation is prohibited.</p>`
+    },
+    'seller-terms': {
+        title: 'Seller Partner Terms and Conditions',
+        content: `<h2>Seller Partner Terms and Conditions</h2><p>Terms for store merchants, retail vendors, and quick-commerce sellers listing products on Eqosy.</p><h3>1. Inventory & Pricing</h3><p>Sellers are responsible for keeping product pricing, stock availability, and descriptions accurate and updated.</p><h3>2. Dispatch</h3><p>Orders must be packed securely and handed over to delivery partners promptly.</p>`
+    },
+    privacy: {
+        title: 'User Privacy Policy',
+        content: `<h2>User Privacy Policy</h2><p>Eqosy values your privacy. This Privacy Policy details how we collect, use, and protect your personal information.</p><h3>1. Information We Collect</h3><p>We collect your phone number, name, email address, delivery addresses, and precise GPS location when using active app features.</p><h3>2. How We Use Information</h3><p>Location data is used solely to match you with nearby drivers, calculate delivery distances, and fulfill orders.</p><h3>3. Data Security</h3><p>We implement end-to-end security protocols. We do not sell or trade your personal information to third parties.</p>`
+    },
+    'restaurant-privacy': {
+        title: 'Restaurant Partner Privacy Policy',
+        content: `<h2>Restaurant Partner Privacy Policy</h2><p>This privacy policy outlines how merchant financial details, store locations, contact details, and operational data are handled securely by Eqosy.</p><h3>1. Merchant Data Collection</h3><p>We collect restaurant business details, store GPS locations, owner contact numbers, FSSAI licenses, and bank account details required for order fulfillment and payouts.</p><h3>2. Financial & Banking Privacy</h3><p>Bank details, tax identifiers (GST/PAN), and daily transaction payouts are encrypted and stored in compliance with banking security standards.</p><h3>3. Operational Analytics</h3><p>Store order volume, customer rating aggregations, and performance metrics are processed to provide analytics dashboards and improve service efficiency.</p><h3>4. Data Sharing Scope</h3><p>Store location and menu details are made public to app users for order placement. Contact numbers are masked during customer communication.</p>`
+    },
+    'delivery-privacy': {
+        title: 'Delivery Partner Privacy Policy',
+        content: `<h2>Delivery Partner Privacy Policy</h2><p>Outlines delivery partner background checks, live GPS tracking during shifts, document verification, and wallet transaction privacy rules.</p><h3>1. Location Data Collection</h3><p>Background and high-accuracy GPS location data is collected ONLY when your partner app status is set to "ONLINE" or during active delivery tasks.</p><h3>2. Purpose of Location Tracking</h3><p>Location data is required to assign nearby pickup orders, route delivery paths, estimate arrival times, and provide real-time tracking to customers.</p><h3>3. Verification Documents</h3><p>Driving license, vehicle RC, identity cards, and selfie verifications are stored securely and reviewed strictly for onboarding and safety compliance.</p>`
+    },
+    'driver-privacy': {
+        title: 'Driver Partner Privacy Policy',
+        content: `<h2>Driver Partner Privacy Policy</h2><p>Outlines driver document verification, trip route tracking, location monitoring, and account data security standards for Eqosy Taxi.</p><h3>1. Duty Location Tracking</h3><p>High-precision location data is collected while on duty or during active ride assignments to match rider pickup points and provide trip navigation.</p><h3>2. Safety & SOS Monitoring</h3><p>Location logs during active trips are monitored to support emergency SOS features, route deviation alerts, and safety audits.</p><h3>3. Contact Masking</h3><p>Rider and driver phone numbers are masked through anonymous proxy numbers during in-app call connections.</p>`
+    },
+    'seller-privacy': {
+        title: 'Seller Partner Privacy Policy',
+        content: `<h2>Seller Partner Privacy Policy</h2><p>Outlines seller account confidentiality, store metrics, financial settlements, and product catalog data protection protocols.</p><h3>1. Merchant Confidentiality</h3><p>Store sales volume, wholesale supplier details, and private commercial metrics remain confidential and accessible only to authorized store users.</p><h3>2. Payout Security</h3><p>Bank accounts and payout transaction records are secured using standard financial data protection protocols.</p>`
+    },
+    refund: { title: 'Refund Policy', content: `<h2>Refund Policy</h2><p>Orders canceled before restaurant confirmation or due to partner unavailability will be fully refunded to the original payment method within 3-5 business days.</p>` },
+    shipping: { title: 'Shipping Policy', content: `<h2>Delivery & Shipping Policy</h2><p>Orders are dispatched immediately via local delivery partners. Estimated delivery times are shown prior to order placement based on live traffic and preparation time.</p>` },
+    cancellation: { title: 'Cancellation Policy', content: 'A cancellation charge will apply as per configured rules once order is confirmed.' },
+    home: {
+        eyebrowBadge: "INDIA'S #1 UNIFIED SUPER APP",
+        heroTitle: "Move, Eat & Shop in One Unified App.",
+        heroSubtitle: "Fast food delivery, instant rides, 15-min groceries and express parcels — seamlessly connected in one app.",
+        ctaPrimaryText: "Book Ride Now",
+        ctaSecondaryText: "Become a Driver",
+        heroImage: "https://images.unsplash.com/photo-1449965408869-eaa3f722e40d?q=80&w=1000",
+        appStoreUrl: "https://apple.com",
+        playStoreUrl: "https://play.google.com",
+        stats: [
+            { label: "Total Rides", value: "1M+" },
+            { label: "Active Drivers", value: "50K+" },
+            { label: "Cities Covered", value: "100+" },
+            { label: "Rating", value: "4.9/5" }
+        ],
+        features: [
+            { id: 1, title: "Food", desc: "Gourmet Meals & Street Food", icon: "🍔" },
+            { id: 2, title: "Rides", desc: "City Cabs & Ride Pooling", icon: "🚕" },
+            { id: 3, title: "Grocery", desc: "Daily Essentials & Fresh Farm", icon: "🛒" },
+            { id: 4, title: "Parcel", desc: "Express Citywide Couriers", icon: "📦" }
+        ]
+    }
+};
+
+export const getPublicPageByKey = async (key) => {
+    const k = normalizeKey(key);
+    const doc = await FoodPageContent.findOne({ key: k }).lean();
+    if (!doc) {
+        if (k === 'about') {
+            return { key: k, data: { appName: 'Eqosy', version: '1.0.0', description: '', logo: '' } };
+        }
+        if (k === 'home') {
+            return { key: k, data: DEFAULT_PAGES.home };
+        }
+        return { key: k, data: DEFAULT_PAGES[k] || { title: '', content: '' } };
+    }
+    if (k === 'about') return { key: k, data: normalizeAboutForResponse(doc.about || null) };
+    if (k === 'home') return { key: k, data: doc.home || DEFAULT_PAGES.home };
+    const legalData = normalizeLegalForResponse(doc.legal || null);
+    if (!legalData || !legalData.content || !legalData.content.trim()) {
+        return { key: k, data: DEFAULT_PAGES[k] || legalData || { title: '', content: '' } };
+    }
+    return { key: k, data: legalData };
+};
+
+export const getAdminPageByKey = async (key) => getPublicPageByKey(key);
+
+const VALID_LEGAL_KEYS = [
+    'terms', 'restaurant-terms', 'delivery-terms', 'driver-terms', 'seller-terms',
+    'privacy', 'restaurant-privacy', 'delivery-privacy', 'driver-privacy', 'seller-privacy',
+    'refund', 'shipping', 'cancellation'
+];
+
+export const upsertLegalPage = async (key, payload, updatedBy) => {
+    const k = normalizeKey(key);
+    if (!VALID_LEGAL_KEYS.includes(k)) {
+        throw new ValidationError('Invalid page key');
+    }
+    const title = String(payload?.title || '').trim();
+    const content = decodeHtmlEntities(String(payload?.content || '')).trim();
+
+    const doc = await FoodPageContent.findOneAndUpdate(
+        { key: k },
+        {
+            $set: {
+                key: k,
+                legal: { title, content },
+                about: undefined,
+                updatedBy: updatedBy || null,
+                updatedByRole: 'ADMIN'
+            }
+        },
+        { upsert: true, new: true }
+    ).lean();
+
+    return { key: k, data: normalizeLegalForResponse(doc?.legal || null) };
+};
+
+export const upsertAboutPage = async (payload, updatedBy) => {
+    const appName = decodeHtmlEntities(String(payload?.appName || '')).trim() || 'Eqosy';
+    const version = decodeHtmlEntities(String(payload?.version || '')).trim() || '1.0.0';
+    const description = decodeHtmlEntities(String(payload?.description || '')).trim();
+    const logo = decodeHtmlEntities(String(payload?.logo || '')).trim();
+    const features = Array.isArray(payload?.features) ? payload.features : [];
+    const stats = Array.isArray(payload?.stats) ? payload.stats : [];
+
+    const normalizedFeatures = features.map((f, idx) => ({
+        icon: String(f?.icon || 'Heart'),
+        title: String(f?.title || ''),
+        description: String(f?.description || ''),
+        color: String(f?.color || ''),
+        bgColor: String(f?.bgColor || ''),
+        order: Number.isFinite(Number(f?.order)) ? Number(f.order) : idx
+    }));
+
+    const doc = await FoodPageContent.findOneAndUpdate(
+        { key: 'about' },
+        {
+            $set: {
+                key: 'about',
+                about: { appName, version, description, logo, features: normalizedFeatures, stats },
+                legal: undefined,
+                updatedBy: updatedBy || null,
+                updatedByRole: 'ADMIN'
+            }
+        },
+    ).lean();
+
+    return { key: 'about', data: normalizeAboutForResponse(doc?.about || null) };
+};
+
+export const upsertHomePage = async (payload, updatedBy) => {
+    const homeData = payload?.home || payload || {};
+    const doc = await FoodPageContent.findOneAndUpdate(
+        { key: 'home' },
+        {
+            $set: {
+                key: 'home',
+                home: homeData,
+                legal: undefined,
+                about: undefined,
+                updatedBy: updatedBy || null,
+                updatedByRole: 'ADMIN'
+            }
+        },
+        { upsert: true, new: true }
+    ).lean();
+
+    return { key: 'home', data: doc?.home || homeData };
+};
+
+

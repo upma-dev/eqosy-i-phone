@@ -1,0 +1,529 @@
+import mongoose from 'mongoose';
+import { logger } from '../../../../utils/logger.js';
+import {
+  sendNotificationToOwner,
+  sendNotificationToOwners,
+} from "../../../../core/notifications/firebase.service.js";
+import { getIO, rooms, resolveRoomOwnerId } from '../../../../config/socket.js';
+import { addOrderJob } from '../../../../queues/producers/order.producer.js';
+
+export function enqueueOrderEvent(action, payload = {}) {
+  try {
+    void addOrderJob({ action, ...payload }).catch((err) => {
+      logger.warn(`BullMQ enqueue order event failed: ${action} - ${err?.message || err}`);
+    });
+  } catch (err) {
+    logger.warn(`BullMQ enqueue order event failed (sync): ${action} - ${err?.message || err}`);
+  }
+}
+
+export function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+/** Cycle and electric scooter riders never get an order whose trip is longer than this (admin can only lower it). */
+export const LIGHT_VEHICLE_MAX_TRIP_KM = 7;
+/** Electric scooters can take slightly longer trips than cycles. */
+export const ELECTRIC_SCOOTER_MAX_TRIP_KM = 8;
+// Straight-line distance is always shorter than the road; this brings it close to what the customer sees.
+const ROAD_DISTANCE_FACTOR = 1.3;
+
+export const normalizeVehicleKey = (vehicleType) =>
+  String(vehicleType || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+
+/** Max km one trip may be for this vehicle, or null if the vehicle has no limit. */
+export function getVehicleTripLimitKm(vehicleType, { maxDistanceCycle, maxDistanceElectricScooter } = {}) {
+  const vehicle = normalizeVehicleKey(vehicleType);
+  const pick = (value, fallback) => (Number(value) > 0 ? Number(value) : fallback);
+  if (vehicle === 'cycle' || vehicle === 'bicycle') {
+    return Math.min(pick(maxDistanceCycle, 5), LIGHT_VEHICLE_MAX_TRIP_KM);
+  }
+  if (vehicle.includes('scooter') || vehicle === 'ev' || vehicle.startsWith('electric')) {
+    return Math.min(pick(maxDistanceElectricScooter, ELECTRIC_SCOOTER_MAX_TRIP_KM), ELECTRIC_SCOOTER_MAX_TRIP_KM);
+  }
+  return null;
+}
+
+/** True when this vehicle must not receive the order (restaurant -> customer leg + rider -> restaurant leg). */
+export function exceedsVehicleTripLimit(vehicleType, { deliveryKm = 0, pickupKm = 0 } = {}, settings = {}) {
+  const limit = getVehicleTripLimitKm(vehicleType, settings);
+  if (limit === null) return false;
+  const total = (Number(deliveryKm) || 0) * ROAD_DISTANCE_FACTOR + (Number(pickupKm) || 0);
+  return total > limit;
+}
+
+export function generateFourDigitDeliveryOtp() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
+export function sanitizeOrderForExternal(orderDoc) {
+  const o = orderDoc?.toObject ? orderDoc.toObject() : { ...(orderDoc || {}) };
+  delete o.deliveryOtp;
+  const dv = o.deliveryVerification;
+  if (dv && dv.dropOtp != null) {
+    const d = dv.dropOtp;
+    o.deliveryVerification = {
+      ...dv,
+      dropOtp: {
+        required: Boolean(d.required),
+        verified: Boolean(d.verified),
+      },
+    };
+  }
+  o.orderMongoId = (o._id || orderDoc?._id || "").toString();
+  // Ensure orderId field for UI always contains the pretty ID
+  o.orderId = o.order_id || o.orderMongoId; 
+
+  // Enrich restaurantLocation & restaurantAddress for Delivery Partner navigation
+  const restObj = o.restaurantId && typeof o.restaurantId === 'object' ? o.restaurantId : {};
+  const restLocObj = restObj.location || o.restaurantLocation || {};
+  const restCoords = Array.isArray(restLocObj.coordinates) ? restLocObj.coordinates : [];
+  
+  const restLat = o.restaurant_lat ?? o.restaurantLat ?? restLocObj.latitude ?? restLocObj.lat ?? (restCoords.length >= 2 ? restCoords[1] : null);
+  const restLng = o.restaurant_lng ?? o.restaurantLng ?? restLocObj.longitude ?? restLocObj.lng ?? (restCoords.length >= 2 ? restCoords[0] : null);
+
+  const restAddress = o.restaurantAddress || restLocObj.formattedAddress || restLocObj.address || [restObj.addressLine1, restObj.area, restObj.city].filter(Boolean).join(', ') || '';
+
+  if (!o.restaurantName) {
+    o.restaurantName = restObj.restaurantName || restObj.name || o.restaurant_name || 'Restaurant';
+  }
+
+  if (restAddress) {
+    o.restaurantAddress = restAddress;
+  }
+
+  if (restLat != null && restLng != null && !isNaN(Number(restLat)) && !isNaN(Number(restLng))) {
+    o.restaurant_lat = Number(restLat);
+    o.restaurant_lng = Number(restLng);
+    o.restaurantLocation = {
+      lat: Number(restLat),
+      lng: Number(restLng),
+      latitude: Number(restLat),
+      longitude: Number(restLng),
+      address: restAddress || o.restaurantAddress,
+      coordinates: [Number(restLng), Number(restLat)]
+    };
+  }
+
+  // Enrich Payment Status & Cash Collection Summary for Delivery Partners
+  Object.assign(o, buildRiderPaymentFields(o));
+
+  return o;
+}
+
+/**
+ * What the delivery partner must know about money: already paid (online / wallet) -> collect nothing,
+ * otherwise (COD / unpaid QR) -> collect the order total. Shared by every payload that reaches a rider.
+ */
+export function buildRiderPaymentFields(orderLike = {}) {
+  const o = orderLike || {};
+  const rawMethod = String(o.paymentMethod || o.payment?.method || 'cash').trim().toLowerCase();
+  const rawStatus = String(o.paymentStatus || o.payment?.status || 'unpaid').trim().toLowerCase();
+  const isPrepaid = ['wallet', 'razorpay', 'card', 'online', 'upi', 'paytm', 'netbanking'].includes(rawMethod) ||
+                    ['paid', 'completed', 'captured', 'settled'].includes(rawStatus);
+  const totalAmount = Number(o.pricing?.total ?? o.total ?? o.amounts?.totalCustomerPaid ?? 0) || 0;
+  const methodLabel = rawMethod.startsWith('razorpay') ? 'ONLINE' : rawMethod.toUpperCase();
+  return {
+    isPaid: isPrepaid,
+    paymentMethod: rawMethod,
+    paymentStatus: isPrepaid ? 'paid' : rawStatus,
+    collectCash: !isPrepaid,
+    collectCashAmount: isPrepaid ? 0 : totalAmount,
+    amountToCollect: isPrepaid ? 0 : totalAmount,
+    paymentSummary: {
+      isPaid: isPrepaid,
+      paymentMethod: rawMethod,
+      paymentStatus: isPrepaid ? 'paid' : rawStatus,
+      collectAmount: isPrepaid ? 0 : totalAmount,
+      collectCash: !isPrepaid,
+      displayTitle: isPrepaid ? 'PAID VIA WALLET / ONLINE' : 'COLLECT CASH ON DELIVERY',
+      displaySubtext: isPrepaid
+        ? `Payment is already completed via ${methodLabel}. Collect ₹0 from customer.`
+        : `Please collect ₹${totalAmount.toFixed(2)} cash from customer.`,
+      noteForDriver: isPrepaid
+        ? `PAID ALREADY via ${methodLabel} (COLLECT ₹0 CASH)`
+        : `COLLECT CASH: ₹${totalAmount.toFixed(2)}`,
+    },
+  };
+}
+
+export function emitOrderStatusSocket({ userId, restaurantId, deliveryPartnerId } = {}, payload = {}) {
+  try {
+    const io = getIO();
+    if (!io) return;
+    if (userId) io.to(rooms.user(userId)).emit('order_status_update', payload);
+    if (restaurantId) io.to(rooms.restaurant(restaurantId)).emit('order_status_update', payload);
+    if (deliveryPartnerId) io.to(rooms.delivery(deliveryPartnerId)).emit('order_status_update', payload);
+  } catch (error) {
+    logger.warn(`emitOrderStatusSocket failed: ${error?.message || error}`);
+  }
+}
+
+export function emitDeliveryDropOtpToUser(order, plainOtp) {
+  try {
+    const io = getIO();
+    if (!io || !plainOtp || !order?.userId) return;
+    io.to(rooms.user(order.userId)).emit("delivery_drop_otp", {
+      orderMongoId: order._id?.toString?.(),
+      orderId: order.order_id || order._id?.toString?.(),
+      otp: plainOtp,
+      message:
+        "Share this OTP with your delivery partner to hand over the order.",
+    });
+  } catch (e) {
+    logger.warn(`emitDeliveryDropOtpToUser failed: ${e?.message || e}`);
+  }
+}
+
+export async function notifyOwnersSafely(targets, payload) {
+  try {
+    await sendNotificationToOwners(targets, payload);
+  } catch (error) {
+    logger.warn(`FCM notification failed: ${error?.message || error}`);
+  }
+}
+
+/**
+ * Instant entry in every open admin panel's notification bar (plus a toast). `zoneId` lets zone-limited admins
+ * see only their own zone. Fire-and-forget: never throws.
+ */
+export function adminBell({ title, message, path = '/admin/food/cancellation-center', type = 'info', category = 'cancellation', zoneId = null, orderMongoId = '' } = {}) {
+  try {
+    const io = getIO();
+    if (!io) return;
+    io.to('admin_room').emit('admin_notification', {
+      id: `${category}-${orderMongoId || 'x'}-${Date.now()}`,
+      title, message, type, category, path, zoneId: zoneId ? String(zoneId) : undefined,
+      orderMongoId: orderMongoId ? String(orderMongoId) : undefined, createdAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.warn(`Admin bell failed: ${error?.message || error}`);
+  }
+}
+
+export async function notifyAdminsSafely(payload) {
+  try {
+    const { notifyAdminsSafely: firebaseNotifyAdmins } = await import("../../../../core/notifications/firebase.service.js");
+    await firebaseNotifyAdmins(payload);
+  } catch (error) {
+    logger.warn(`FCM admin notification failed: ${error?.message || error}`);
+  }
+}
+
+export async function notifyOwnerSafely(target, payload) {
+  try {
+    await sendNotificationToOwner({ ...target, payload });
+  } catch (error) {
+    logger.warn(`FCM notification failed: ${error?.message || error}`);
+  }
+}
+
+export function buildOrderIdentityFilter(orderIdOrMongoId) {
+  const raw = String(orderIdOrMongoId || "").trim();
+  if (!raw) return null;
+  if (mongoose.isValidObjectId(raw))
+    return { _id: new mongoose.Types.ObjectId(raw) };
+  
+  // Search BOTH underscore and camelCase variants for robust lookup
+  return { 
+    $or: [
+        { order_id: raw },
+        { orderId: raw }
+    ]
+  };
+}
+
+export function toGeoPoint(lat, lng) {
+  if (lat == null || lng == null) return undefined;
+  const a = Number(lat);
+  const b = Number(lng);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return undefined;
+  return { type: "Point", coordinates: [b, a] };
+}
+
+export function pushStatusHistory(order, { byRole, byId, from, to, note = "" }) {
+  order.statusHistory.push({
+    at: new Date(),
+    byRole,
+    byId: byId || undefined,
+    from,
+    to,
+    note,
+  });
+}
+
+export function normalizeOrderForClient(orderDoc) {
+  const order = orderDoc?.toObject ? orderDoc.toObject() : orderDoc || {};
+  const mongoId = (order._id || orderDoc?._id || "").toString();
+  const displayId = order.order_id || mongoId;
+  const distanceKm = order.distanceKm ?? order.pricing?.distanceKm ?? order.pricing?.deliveryFeeBreakdown?.distanceKm ?? null;
+  return {
+    ...order,
+    orderMongoId: mongoId,
+    orderId: displayId,
+    distanceKm: distanceKm != null && !isNaN(Number(distanceKm)) ? Number(distanceKm) : null,
+    status: order?.orderStatus || order?.status || "",
+    deliveredAt:
+      order?.deliveryState?.deliveredAt || order?.deliveredAt || null,
+    deliveryPartnerId:
+      order?.dispatch?.deliveryPartnerId || order?.deliveryPartnerId || null,
+    rating: order?.ratings?.restaurant?.rating ?? order?.rating ?? null,
+    deliveryState: {
+      ...(order?.deliveryState || {}),
+      currentLocation: order?.lastRiderLocation?.coordinates?.length >= 2 ? {
+        lat: order.lastRiderLocation.coordinates[1],
+        lng: order.lastRiderLocation.coordinates[0]
+      } : (order?.deliveryState?.currentLocation || null)
+    }
+  };
+}
+
+export async function applyAggregateRating(model, entityId, newRating) {
+  if (!entityId) return;
+  const doc = await model.findById(entityId).select("rating totalRatings");
+  if (!doc) return;
+
+  const totalRatings = Number(doc.totalRatings || 0);
+  const currentAverage = Number(doc.rating || 0);
+  const nextTotal = totalRatings + 1;
+  const nextAverage = Number(
+    ((currentAverage * totalRatings + Number(newRating)) / nextTotal).toFixed(1),
+  );
+
+  doc.totalRatings = nextTotal;
+  doc.rating = nextAverage;
+  await doc.save();
+}
+
+export function buildDeliverySocketPayload(orderDoc, restaurantDoc = null) {
+  const order = orderDoc?.toObject ? orderDoc.toObject() : orderDoc || {};
+  const restaurant = restaurantDoc || order?.restaurantId || null;
+  const restaurantLocation = restaurant?.location || {};
+  const deliveryAddress = order?.deliveryAddress || {};
+  const customerAddressParts = [
+    deliveryAddress.street,
+    deliveryAddress.additionalDetails,
+    deliveryAddress.city,
+    deliveryAddress.state,
+    deliveryAddress.zipCode,
+  ]
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+
+  return {
+    orderMongoId:
+      orderDoc?._id?.toString?.() || order?._id?.toString?.() || order?._id,
+    orderId: order?.order_id || order?._id?.toString?.(),
+    status: orderDoc?.orderStatus || order?.orderStatus,
+    items: order?.items || [],
+    pricing: order?.pricing,
+    total: order?.pricing?.total,
+    payment: order?.payment,
+    paymentMethod: order?.payment?.method,
+    ...buildRiderPaymentFields(order),
+    restaurantId:
+      order?.restaurantId?._id?.toString?.() ||
+      order?.restaurantId?.toString?.() ||
+      order?.restaurantId,
+    restaurantName: restaurant?.restaurantName || order?.restaurantName,
+    restaurantAddress:
+      restaurantLocation?.address ||
+      restaurantLocation?.formattedAddress ||
+      restaurant?.addressLine1 ||
+      "",
+    restaurantPhone:
+      restaurant?.phone ||
+      restaurant?.ownerPhone ||
+      restaurant?.primaryContactNumber ||
+      "",
+    restaurantLocation: {
+      latitude: restaurantLocation?.latitude,
+      longitude: restaurantLocation?.longitude,
+      address:
+        restaurantLocation?.address ||
+        restaurantLocation?.formattedAddress ||
+        restaurant?.addressLine1 ||
+        "",
+      area: restaurantLocation?.area || restaurant?.area || "",
+      city: restaurantLocation?.city || restaurant?.city || "",
+      state: restaurantLocation?.state || restaurant?.state || "",
+    },
+    deliveryAddress: order?.deliveryAddress,
+    customerAddress: customerAddressParts.length ? customerAddressParts.join(', ') : "",
+    customerName: order?.customerName || order?.deliveryAddress?.fullName || order?.deliveryAddress?.name || order?.userId?.name || "",
+    customerPhone: order?.customerPhone || order?.deliveryAddress?.phone || order?.userId?.phone || "",
+    userName: order?.customerName || order?.deliveryAddress?.fullName || order?.deliveryAddress?.name || order?.userId?.name || "",
+    userPhone: order?.customerPhone || order?.deliveryAddress?.phone || order?.userId?.phone || "",
+    note: order?.note || "",
+    riderEarning: order?.riderEarning || 0,
+    earnings: order?.riderEarning || order?.pricing?.deliveryFee || 0,
+    deliveryFee: order?.pricing?.deliveryFee || 0,
+    surgeAmount: order?.pricing?.surgeAmount || order?.surgeAmount || 0,
+    surgeTitle: order?.pricing?.surgeTitle || order?.surgeTitle || "Surge Charge",
+    deliveryPartnerTip: order?.pricing?.deliveryPartnerTip || order?.deliveryPartnerTip || order?.tip || 0,
+    deliveryFleet: order?.deliveryFleet,
+    dispatch: order?.dispatch,
+    createdAt: order?.createdAt,
+    updatedAt: order?.updatedAt,
+  };
+}
+
+export function canExposeOrderToRestaurant(orderLike) {
+  if (String(orderLike?.orderStatus || "").toLowerCase() === "pending_payment") return false;
+  const method = String(orderLike?.payment?.method || "").toLowerCase();
+  const status = String(orderLike?.payment?.status || "").toLowerCase();
+  if (["cash", "wallet"].includes(method)) return true;
+  return ["paid", "authorized", "captured", "settled"].includes(status);
+}
+
+
+export async function notifyRestaurantNewOrder(orderDoc) {
+  try {
+    if (!orderDoc || !canExposeOrderToRestaurant(orderDoc)) return;
+
+    const targetRestaurantId = resolveRoomOwnerId(orderDoc.restaurantId);
+    if (!targetRestaurantId) {
+      logger.warn(`notifyRestaurantNewOrder: Missing restaurantId for order ${orderDoc._id || ''}`);
+      return;
+    }
+
+    const io = getIO();
+    if (io) {
+      const payload = {
+        ...orderDoc.toObject(),
+        restaurantId: targetRestaurantId,
+        orderMongoId: orderDoc._id?.toString?.() || undefined,
+        orderId: orderDoc.order_id || orderDoc._id?.toString?.(),
+      };
+      logger.info(
+        `[RestaurantOrders] Emitting new_order strictly to ${rooms.restaurant(targetRestaurantId)} for order ${orderDoc._id?.toString?.() || ''}`,
+      );
+      io.to(rooms.restaurant(targetRestaurantId)).emit("new_order", payload);
+    }
+
+    await notifyOwnersSafely(
+      [{ ownerType: "RESTAURANT", ownerId: targetRestaurantId }],
+      {
+        title: "New order received 🔔",
+        body: `Order #${orderDoc.order_id || orderDoc._id} is waiting for review.`,
+        data: {
+          type: "new_order",
+          orderId: orderDoc._id.toString(),
+          orderMongoId: orderDoc._id?.toString?.() || "",
+          restaurantId: targetRestaurantId,
+          link: `/restaurant/orders/${orderDoc._id?.toString?.() || ""}`,
+        },
+      },
+    );
+  } catch (notifyErr) {
+    logger.warn(`notifyRestaurantNewOrder failed: ${notifyErr?.message || notifyErr}`);
+  }
+}
+
+export const STATUS_PRIORITY = {
+  created: 10,
+  confirmed: 20,
+  preparing: 30,
+  ready_for_pickup: 40,
+  reached_pickup: 50,
+  picked_up: 60,
+  reached_drop: 70,
+  delivered: 80,
+  returned_to_restaurant: 100,
+  cancelled_by_user: 100,
+  cancelled_by_restaurant: 100,
+  cancelled_by_admin: 100,
+};
+
+/**
+ * Returns true if the next status is a valid forward progression from the current status.
+ * Prevents "reversing" order status (e.g. from Preparing back to Created).
+ */
+export function isStatusAdvance(current, next) {
+  // If current status is missing, it's effectively 'created' or start of flow
+  if (!current) return true;
+  
+  const currentPrio = STATUS_PRIORITY[current] || 0;
+  const nextPrio = STATUS_PRIORITY[next] || 0;
+
+  // Terminal states (100) cannot transition to anything else
+  if (currentPrio >= 100) return false;
+  
+  // Delivered (80) cannot transition to anything (except maybe cancellation if allowed, but here we say no)
+  if (currentPrio === 80) return false;
+
+  // Special case: Cancellation is almost always an advance unless already delivered
+  if (nextPrio === 100 && currentPrio < 80) return true;
+
+  return nextPrio > currentPrio;
+}
+
+/**
+ * Validates whether an order contains all required delivery information before dispatching to delivery partners.
+ */
+export function validateOrderDeliveryInfo(orderDoc, restaurantDoc = null) {
+  const order = orderDoc?.toObject ? orderDoc.toObject() : orderDoc || {};
+  let restaurant = restaurantDoc?.toObject ? restaurantDoc.toObject() : (restaurantDoc || order?.restaurantId || null);
+  if (restaurant && typeof restaurant === 'object' && mongoose.isValidObjectId(restaurant)) {
+    restaurant = null;
+  }
+
+  const missingFields = [];
+
+  // 1. Verify Restaurant Info
+  const restName = restaurant?.restaurantName || restaurant?.name || order?.restaurantName;
+  if (!restName) {
+    missingFields.push('restaurantName');
+  }
+
+  const restLoc = restaurant?.location || order?.restaurantLocation || {};
+  const hasRestCoords = Array.isArray(restLoc.coordinates) && restLoc.coordinates.length >= 2 &&
+    Number.isFinite(Number(restLoc.coordinates[0])) && Number.isFinite(Number(restLoc.coordinates[1]));
+  const hasRestAddress = Boolean(
+    restLoc.address || restLoc.formattedAddress || restaurant?.addressLine1 || restaurant?.area || restaurant?.city || order?.restaurantAddress
+  );
+
+  if (!hasRestCoords && !hasRestAddress) {
+    missingFields.push('restaurantLocation');
+  }
+
+  // 2. Verify Delivery Address & Location
+  const delAddr = order?.deliveryAddress || {};
+  const hasAddrString = Boolean(
+    delAddr.street || delAddr.additionalDetails || delAddr.city || delAddr.formattedAddress || delAddr.addressLine1 || order?.customerAddress || order?.address
+  );
+  const delCoords = delAddr.location?.coordinates || [];
+  const hasDelCoords = Array.isArray(delCoords) && delCoords.length >= 2 &&
+    Number.isFinite(Number(delCoords[0])) && Number.isFinite(Number(delCoords[1]));
+
+  if (!hasAddrString && !hasDelCoords) {
+    missingFields.push('deliveryAddress');
+  }
+
+  // 3. Verify Customer Phone / Contact Details
+  const customerPhone = String(
+    order?.customerPhone || delAddr.phone || delAddr.contactPhone || order?.userId?.phone || order?.userPhone || ''
+  ).trim();
+
+  // A missing customer phone must not stop dispatch: riders can still deliver using the in-app address.
+  void customerPhone;
+
+  const isValid = missingFields.length === 0;
+  const reason = isValid ? '' : `Missing required fields: ${missingFields.join(', ')}`;
+
+  return {
+    isValid,
+    missingFields,
+    reason,
+  };
+}
+
+

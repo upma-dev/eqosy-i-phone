@@ -1,0 +1,418 @@
+import { FoodTransaction } from '../models/foodTransaction.model.js';
+import { resolveOrderCommission } from '../../admin/services/commissionLeague.service.js';
+import { recordTransaction } from '../../../../core/payments/transaction.service.js';
+import { Transaction } from '../../../../core/payments/models/transaction.model.js';
+import { logger } from '../../../../utils/logger.js';
+import mongoose from 'mongoose';
+
+export function computeRestaurantCommissionAmount(baseAmount, rule) {
+    const safeBase = Math.max(0, Number(baseAmount) || 0);
+    if (!Number.isFinite(safeBase) || safeBase < 0) return 0;
+
+    const commissionType = rule?.defaultCommission?.type || 'percentage';
+    const commissionValue = Math.max(
+        0,
+        Number(rule?.defaultCommission?.value ?? 0) || 0
+    );
+
+    let commissionAmount = 0;
+    if (commissionType === 'percentage') {
+        commissionAmount = safeBase * (commissionValue / 100);
+    } else if (commissionType === 'amount') {
+        commissionAmount = commissionValue;
+    }
+
+    // Round to 2 decimals and clamp to [0, base]
+    commissionAmount = Math.round((commissionAmount || 0) * 100) / 100;
+    commissionAmount = Math.max(0, Math.min(commissionAmount, safeBase));
+
+    return { commissionAmount, commissionType, commissionValue, baseAmount: safeBase };
+}
+
+/**
+ * Commission for a NEW order, decided server-side from the food subtotal only (no delivery / platform fee / tax).
+ * Custom admin commission wins; otherwise the restaurant's current calendar-month league slab applies.
+ * Besides the amount it returns how it was derived so the caller can freeze it on the order.
+ */
+export async function getRestaurantCommissionSnapshot(orderDoc) {
+    const baseAmount = Number(orderDoc?.pricing?.subtotal ?? 0) || 0;
+    const restaurantIdRaw = orderDoc?.restaurantId?._id ?? orderDoc?.restaurantId ?? null;
+
+    const result = await resolveOrderCommission({ restaurantId: restaurantIdRaw, baseAmount });
+    return {
+        commissionAmount: result.commissionAmount,
+        commissionType: result.commissionType,
+        commissionValue: result.commissionValue,
+        commissionRate: result.commissionRate,
+        source: result.source,
+        leagueKey: result.leagueKey,
+        monthKey: result.monthKey,
+        baseAmount: result.baseAmount,
+    };
+}
+
+/**
+ * Creates an initial 'pending' transaction when an order is created.
+ */
+export async function createInitialTransaction(order) {
+    if (!order) return null;
+
+    // Only recompute for legacy orders that have no commission frozen on them.
+    const { commissionAmount = 0 } = order.pricing?.restaurantCommissionSource
+        ? { commissionAmount: Number(order.pricing.restaurantCommission) || 0 }
+        : await getRestaurantCommissionSnapshot(order).catch(() => ({ commissionAmount: 0 }));
+
+    // Split logic - Ensure all values are finite numbers
+    const totalCustomerPaid = Number(order.pricing?.total) || 0;
+    const riderShare = Number(order.riderTotalPayout) || Number(order.riderEarning) || 0;
+
+    // Prefer commission already computed & stored on the order (source of truth for this order),
+    // fallback to rule snapshot for older orders.
+    const restaurantCommissionFromOrder = Number(order.pricing?.restaurantCommission);
+    const commissionFrozenOnOrder = Boolean(order.pricing?.restaurantCommissionSource);
+    const restaurantCommission =
+        Number.isFinite(restaurantCommissionFromOrder) && (restaurantCommissionFromOrder > 0 || commissionFrozenOnOrder)
+            ? restaurantCommissionFromOrder
+            : (Number(commissionAmount) || 0);
+
+    const discount = Number(order.pricing?.discount) || 0;
+    const subtotal = Number(order.pricing?.subtotal) || 0;
+    const packagingFee = Number(order.pricing?.packagingFee) || 0;
+    const platformFee = Number(order.pricing?.platformFee) || 0;
+    const deliveryFee = Number(order.pricing?.deliveryFee) || 0;
+    const adminDeliveryCommissionEnabled = order.pricing?.adminDeliveryCommissionEnabled === true;
+    const adminDeliveryCommissionPercent = Number(order.pricing?.adminDeliveryCommissionPercent) || 0;
+    const adminDeliveryCommissionAmount = Number(order.pricing?.adminDeliveryCommissionAmount) || 0;
+    const riderDeliveryEarningAfterAdminCommission = Number(order.pricing?.riderDeliveryEarningAfterAdminCommission) || deliveryFee;
+    const deliveryPartnerIncentiveEnabled = order.pricing?.deliveryPartnerIncentiveEnabled === true;
+    const deliveryPartnerIncentivePercent = Number(order.pricing?.deliveryPartnerIncentivePercent) || 0;
+    const deliveryPartnerIncentiveAmount = Number(order.pricing?.deliveryPartnerIncentiveAmount) || 0;
+    const deliveryPartnerIncentiveEligible = order.pricing?.deliveryPartnerIncentiveEligible === true;
+    const surgeAmount = Number(order.pricing?.surgeAmount) || 0;
+    const tax = Number(order.pricing?.tax) || 0;
+    const riderBasePay = Number(order.riderBasePay) || Number(order.pricing?.deliveryFeeBreakdown?.basePayout) || 0;
+    const riderDeliveryFeeShare = Number(order.riderDeliveryFeeShare) || riderDeliveryEarningAfterAdminCommission;
+    const riderSurgePay = Number(order.riderSurgePay) || surgeAmount;
+    const riderIncentivePay = Number(order.riderIncentivePay) || deliveryPartnerIncentiveAmount;
+    const riderTotalPayout =
+        Number(order.riderTotalPayout) ||
+        Number(order.riderEarning) ||
+        Math.round((riderDeliveryFeeShare + riderSurgePay + riderIncentivePay) * 100) / 100;
+
+    let restaurantNet = subtotal + packagingFee - restaurantCommission;
+    // Admin ONLY gets platform fee + restaurant commission (delivery fee, surge & tip go 100% directly to delivery partner)
+    const additionalChargesTotal = Number(order.pricing?.additionalChargesTotal) || 0;
+    let platformNetProfit = platformFee + additionalChargesTotal + restaurantCommission;
+
+    // Handle discount attribution
+    const couponCode = order.pricing?.couponCode;
+    if (discount > 0 && couponCode) {
+        try {
+            // Dynamic import to avoid circular dependency if any
+            const { FoodOffer } = await import('../../admin/models/offer.model.js');
+            const offer = await FoodOffer.findOne({ couponCode: String(couponCode).toUpperCase() }).lean();
+            if (offer?.createdByRole === 'RESTAURANT') {
+                restaurantNet -= discount;
+            } else {
+                // Admin created (default) or not found
+                platformNetProfit -= discount;
+            }
+        } catch (err) {
+            // Log but don't fail, default to admin attribution
+            platformNetProfit -= discount;
+        }
+    }
+
+    // Ensure nets are finite and rounded
+    restaurantNet = Math.round((Number(restaurantNet) || 0) * 100) / 100;
+    platformNetProfit = Math.max(0, Math.round((Number(platformNetProfit) || 0) * 100) / 100);
+
+    const transaction = new FoodTransaction({
+        orderId: order._id,
+        userId: order.userId,
+        restaurantId: order.restaurantId,
+        deliveryPartnerId: order.dispatch?.deliveryPartnerId,
+        paymentMethod: order.payment?.method || 'cash',
+        status: order.payment?.status === 'paid' ? 'captured' : 'pending',
+        payment: {
+            method: String(order.payment?.method || 'cash'),
+            status: String(order.payment?.status || 'cod_pending'),
+            amountDue: Number(order.payment?.amountDue ?? totalCustomerPaid) || 0,
+            razorpay: {
+                orderId: String(order.payment?.razorpay?.orderId || ''),
+                paymentId: String(order.payment?.razorpay?.paymentId || ''),
+                signature: String(order.payment?.razorpay?.signature || ''),
+            },
+            qr: {
+                qrId: String(order.payment?.qr?.qrId || ''),
+                imageUrl: String(order.payment?.qr?.imageUrl || ''),
+                paymentLinkId: String(order.payment?.qr?.paymentLinkId || ''),
+                shortUrl: String(order.payment?.qr?.shortUrl || ''),
+                status: String(order.payment?.qr?.status || ''),
+                expiresAt: order.payment?.qr?.expiresAt || null,
+            }
+        },
+        pricing: {
+            subtotal: subtotal,
+            tax: tax,
+            packagingFee: packagingFee,
+            deliveryFee: deliveryFee,
+            deliveryFeeBreakdown: order.pricing?.deliveryFeeBreakdown || null,
+            adminDeliveryCommissionEnabled,
+            adminDeliveryCommissionPercent,
+            adminDeliveryCommissionAmount,
+            riderDeliveryEarningAfterAdminCommission,
+            deliveryPartnerIncentiveEnabled,
+            deliveryPartnerIncentivePercent,
+            deliveryPartnerIncentiveAmount,
+            deliveryPartnerIncentiveEligible,
+            platformFee: platformFee,
+            surgeAmount: surgeAmount,
+            restaurantCommission: restaurantCommission,
+            discount: discount,
+            total: totalCustomerPaid,
+            currency: String(order.pricing?.currency || order.currency || 'INR'),
+        },
+        amounts: {
+            totalCustomerPaid: totalCustomerPaid,
+            restaurantShare: Math.max(0, restaurantNet),
+            restaurantCommission: restaurantCommission,
+            riderShare: riderTotalPayout,
+            riderDeliveryFeeShare: riderDeliveryFeeShare,
+            adminDeliveryCommissionAmount: adminDeliveryCommissionAmount,
+            riderBasePay: riderBasePay,
+            riderSurgePay: riderSurgePay,
+            riderIncentivePay: riderIncentivePay,
+            riderTotalPayout: riderTotalPayout,
+            platformNetProfit: platformNetProfit,
+            taxAmount: tax
+        },
+        gateway: {
+            razorpayOrderId: order.payment?.razorpay?.orderId,
+            qrUrl: order.payment?.qr?.imageUrl
+        },
+        history: [{
+            kind: 'created',
+            amount: totalCustomerPaid,
+            note: 'Initial transaction created with order'
+        }]
+    });
+
+    await transaction.save();
+
+    // Link back to the order
+    try {
+        await mongoose.model('FoodOrder').updateOne(
+            { _id: order._id },
+            { $set: { transactionId: transaction._id } }
+        );
+    } catch (err) {
+        // Log but don't fail transaction if the backlink fails
+    }
+
+    return transaction;
+}
+
+/**
+ * Updates transaction status (captured, settled, etc) and appends to history.
+ */
+export async function updateTransactionStatus(orderId, kind, details = {}) {
+    const query = { orderId };
+    const transaction = await FoodTransaction.findOne(query);
+    if (!transaction) return null;
+
+    if (details.status) transaction.status = details.status;
+    if (details.razorpayPaymentId) transaction.gateway.razorpayPaymentId = details.razorpayPaymentId;
+    if (details.razorpaySignature) transaction.gateway.razorpaySignature = details.razorpaySignature;
+
+    transaction.history.push({
+        kind,
+        amount: transaction.amounts?.totalCustomerPaid || 0,
+        at: new Date(),
+        note: details.note || `Transaction updated: ${kind}`,
+        recordedBy: { role: details.recordedByRole || 'SYSTEM', id: details.recordedById }
+    });
+
+    await transaction.save();
+
+    // A refunded order must not keep the restaurant/rider payout that was credited when it was paid.
+    if (details.status === 'refunded') {
+        await reverseOrderPayoutCredits(transaction.orderId);
+    }
+
+    // If transaction is captured or completed, credit store and rider wallets atomically
+    if (transaction.status === 'captured' || ['cod_marked_paid_on_delivery', 'payment_snapshot_sync', 'captured'].includes(kind)) {
+        await creditWalletsForTransaction(transaction);
+    }
+
+    return transaction;
+}
+
+/**
+ * Takes back the restaurant / rider payout credits of an order that was refunded or cancelled.
+ * Idempotent (one reversal per credit row). If the money was already withdrawn the debit is refused and the
+ * failure is logged for manual follow-up instead of silently driving a wallet negative.
+ */
+export async function reverseOrderPayoutCredits(orderId) {
+    if (!orderId) return;
+    const credits = await Transaction.find({
+        orderId,
+        type: 'credit',
+        category: { $in: ['order_payout', 'delivery_payout'] },
+    }).lean();
+
+    for (const credit of credits) {
+        try {
+            await recordTransaction({
+                entityType: credit.entityType,
+                entityId: String(credit.entityId),
+                type: 'debit',
+                amount: credit.amount,
+                description: `Reversal of payout for refunded order ${orderId}`,
+                category: 'adjustment',
+                orderId: String(orderId),
+                idempotencyKey: `reverse:${credit._id}`,
+            });
+        } catch (err) {
+            logger.error(`[FoodTransaction] Could not reverse payout ${credit._id} for order ${orderId}: ${err?.message || err}`);
+        }
+    }
+}
+
+export async function creditWalletsForTransaction(transaction) {
+    if (!transaction || !transaction.orderId) return;
+
+    // Earnings (restaurant + rider) become real only once the order is completed. Online/wallet orders are
+    // captured at payment time, long before delivery, so crediting then would show earnings for orders that
+    // may still get cancelled or refunded.
+    try {
+        const FoodOrderModel = mongoose.model('FoodOrder');
+        const orderState = await FoodOrderModel.findById(transaction.orderId).select('orderStatus').lean();
+        if (!orderState || orderState.orderStatus !== 'delivered') return;
+    } catch (err) {
+        logger.error(`[FoodTransaction] Could not verify order completion for ${transaction.orderId}: ${err?.message || err}`);
+        return;
+    }
+
+    let restaurantShare = Number(transaction.amounts?.restaurantShare) || 0;
+    let riderShare = Number(transaction.amounts?.riderShare || transaction.amounts?.riderTotalPayout) || 0;
+    let riderId = transaction.deliveryPartnerId?._id ? String(transaction.deliveryPartnerId._id) : (transaction.deliveryPartnerId ? String(transaction.deliveryPartnerId) : null);
+
+    // Fallback: If restaurantShare, riderId or riderShare is missing/0, resolve from FoodOrder
+    if ((restaurantShare <= 0 || !riderId || riderId === '[object Object]' || riderShare <= 0) && transaction.orderId) {
+        try {
+            const FoodOrderModel = mongoose.model('FoodOrder');
+            const orderDoc = await FoodOrderModel.findById(transaction.orderId).lean();
+            if (orderDoc) {
+                if (restaurantShare <= 0) {
+                    const subtotal = Number(orderDoc.pricing?.subtotal) || 0;
+                    const packagingFee = Number(orderDoc.pricing?.packagingFee) || 0;
+                    const restaurantCommission = Number(orderDoc.pricing?.restaurantCommission) || 0;
+                    restaurantShare = Math.max(0, subtotal + packagingFee - restaurantCommission);
+                }
+
+                if (!riderId || riderId === '[object Object]') {
+                    const rawPartnerId = orderDoc.dispatch?.deliveryPartnerId || orderDoc.deliveryPartnerId;
+                    riderId = rawPartnerId?._id ? String(rawPartnerId._id) : (rawPartnerId ? String(rawPartnerId) : null);
+                    if (riderId && riderId !== '[object Object]') {
+                        transaction.deliveryPartnerId = new mongoose.Types.ObjectId(riderId);
+                    }
+                }
+
+                if (riderShare <= 0) {
+                    const riderDeliveryFeeShare = Number(orderDoc.riderDeliveryFeeShare || orderDoc.pricing?.riderDeliveryEarningAfterAdminCommission || orderDoc.pricing?.deliveryFee || 0);
+                    const riderSurgePay = Number(orderDoc.riderSurgePay || orderDoc.pricing?.surgeAmount || 0);
+                    const riderIncentivePay = Number(orderDoc.riderIncentivePay || orderDoc.pricing?.deliveryPartnerIncentiveAmount || 0);
+                    const computedPayout = Math.round((riderDeliveryFeeShare + riderSurgePay + riderIncentivePay) * 100) / 100;
+                    riderShare = Number(orderDoc.riderTotalPayout || computedPayout || orderDoc.riderEarning || 0);
+                }
+
+                transaction.amounts = {
+                    ...(transaction.amounts || {}),
+                    restaurantShare,
+                    riderShare,
+                    riderTotalPayout: riderShare,
+                };
+
+                await FoodTransaction.updateOne(
+                    { _id: transaction._id },
+                    {
+                        $set: {
+                            deliveryPartnerId: transaction.deliveryPartnerId,
+                            'amounts.restaurantShare': restaurantShare,
+                            'amounts.riderShare': riderShare,
+                            'amounts.riderTotalPayout': riderShare,
+                        }
+                    }
+                ).catch(() => {});
+            }
+        } catch (err) {
+            logger.error(`[FoodTransaction] Error resolving order fallback for transaction ${transaction._id}: ${err?.message || err}`);
+        }
+    }
+    const restId = transaction.restaurantId?._id ? String(transaction.restaurantId._id) : (transaction.restaurantId ? String(transaction.restaurantId) : null);
+    if (restaurantShare > 0 && restId && restId !== '[object Object]') {
+        try {
+            // The idempotency key makes the credit exactly-once even under concurrent/replayed calls.
+            const result = await recordTransaction({
+                entityType: 'restaurant',
+                entityId: restId,
+                type: 'credit',
+                amount: restaurantShare,
+                description: `Order payout credit for order ${transaction.orderId}`,
+                category: 'order_payout',
+                orderId: String(transaction.orderId),
+                idempotencyKey: `order_payout:restaurant:${transaction.orderId}`,
+            });
+            if (!result.duplicate) {
+                logger.info(`[FoodTransaction] Credited store wallet ${restId} with ₹${restaurantShare} for order ${transaction.orderId}`);
+            }
+        } catch (err) {
+            logger.error(`[FoodTransaction] Error crediting store wallet for order ${transaction.orderId}: ${err?.message || err}`);
+        }
+    }
+
+    if (riderShare > 0 && riderId && riderId !== '[object Object]') {
+        try {
+            const result = await recordTransaction({
+                entityType: 'deliveryBoy',
+                entityId: riderId,
+                type: 'credit',
+                amount: riderShare,
+                description: `Delivery payout credit for order ${transaction.orderId}`,
+                category: 'delivery_payout',
+                orderId: String(transaction.orderId),
+                idempotencyKey: `order_payout:deliveryBoy:${transaction.orderId}`,
+            });
+            if (!result.duplicate) {
+                logger.info(`[FoodTransaction] Credited delivery partner wallet ${riderId} with ₹${riderShare} for order ${transaction.orderId}`);
+            }
+        } catch (err) {
+            logger.error(`[FoodTransaction] Error crediting delivery partner wallet for order ${transaction.orderId}: ${err?.message || err}`);
+        }
+    }
+}
+
+/**
+ * Updates the rider in the transaction when an order is accepted.
+ */
+export async function updateTransactionRider(orderId, riderId) {
+    const query = { orderId };
+    return await FoodTransaction.findOneAndUpdate(
+        query,
+        { $set: { deliveryPartnerId: riderId } },
+        { new: true }
+    );
+}
+
+/**
+ * Marks restaurant as settled in the finance record.
+ */
+export async function settleRestaurant(orderId, adminId) {
+    return await updateTransactionStatus(orderId, 'settled', {
+        status: 'captured', // Ensure it's marked as captured if it was pending cash
+        note: 'Restaurant payout settled by admin',
+        recordedByRole: 'ADMIN',
+        recordedById: adminId
+    });
+}

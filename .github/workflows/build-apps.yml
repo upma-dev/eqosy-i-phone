@@ -20,14 +20,6 @@ jobs:
         app: [user, driver, partner]
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: Eqosy-iPhone
-
-      - uses: actions/checkout@v4
-        with:
-          repository: appzetogit/Eqosy
-          token: ${{ secrets.FRONTEND_REPO_TOKEN }}
-          path: Eqosy
 
       - uses: actions/setup-node@v4
         with:
@@ -35,7 +27,7 @@ jobs:
           cache: npm
           cache-dependency-path: |
             Eqosy/Frontend/package-lock.json
-            Eqosy-iPhone/package-lock.json
+            package-lock.json
 
       - uses: actions/setup-java@v4
         with:
@@ -45,27 +37,26 @@ jobs:
       - name: Install deps
         run: |
           npm ci --prefix Eqosy/Frontend
-          npm ci --prefix Eqosy-iPhone
+          npm ci
 
       - name: Create .env.ios from secret
-        run: echo "${{ secrets.ENV_IOS }}" > Eqosy-iPhone/.env.ios
+        run: echo "${{ secrets.ENV_IOS }}" > .env.ios
 
       - name: Build web + Android project
-        working-directory: Eqosy-iPhone
         run: node scripts/ios.mjs ${{ matrix.app }} android
 
       - name: Add google-services.json (optional)
         if: ${{ secrets.GOOGLE_SERVICES_JSON_B64 != '' }}
-        run: echo "${{ secrets.GOOGLE_SERVICES_JSON_B64 }}" | base64 -d > Eqosy-iPhone/apps/${{ matrix.app }}/android/app/google-services.json
+        run: echo "${{ secrets.GOOGLE_SERVICES_JSON_B64 }}" | base64 -d > apps/${{ matrix.app }}/android/app/google-services.json
 
       - name: Build debug APK
-        working-directory: Eqosy-iPhone/apps/${{ matrix.app }}/android
+        working-directory: apps/${{ matrix.app }}/android
         run: chmod +x gradlew && ./gradlew assembleDebug
 
       - uses: actions/upload-artifact@v4
         with:
           name: eqosy-${{ matrix.app }}-apk
-          path: Eqosy-iPhone/apps/${{ matrix.app }}/android/app/build/outputs/apk/debug/*.apk
+          path: apps/${{ matrix.app }}/android/app/build/outputs/apk/debug/*.apk
 
   ios:
     # Builds the iOS project and checks it compiles (unsigned).
@@ -77,14 +68,6 @@ jobs:
         app: [user, driver, partner]
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: Eqosy-iPhone
-
-      - uses: actions/checkout@v4
-        with:
-          repository: appzetogit/Eqosy
-          token: ${{ secrets.FRONTEND_REPO_TOKEN }}
-          path: Eqosy
 
       - uses: actions/setup-node@v4
         with:
@@ -92,29 +75,28 @@ jobs:
           cache: npm
           cache-dependency-path: |
             Eqosy/Frontend/package-lock.json
-            Eqosy-iPhone/package-lock.json
+            package-lock.json
 
       - name: Install deps
         run: |
           npm ci --prefix Eqosy/Frontend
-          npm ci --prefix Eqosy-iPhone
+          npm ci
 
       - name: Create .env.ios from secret
-        run: echo "${{ secrets.ENV_IOS }}" > Eqosy-iPhone/.env.ios
+        run: echo "${{ secrets.ENV_IOS }}" > .env.ios
 
       - name: Build web + iOS project
-        working-directory: Eqosy-iPhone
         run: node scripts/ios.mjs ${{ matrix.app }}
 
       - name: Unsigned compile check
-        working-directory: Eqosy-iPhone/apps/${{ matrix.app }}/ios/App
+        working-directory: apps/${{ matrix.app }}/ios/App
         run: |
           xcodebuild -project App.xcodeproj -scheme App -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO build
 
       - name: Zip iOS project (open on a Mac in Xcode)
-        run: cd Eqosy-iPhone/apps/${{ matrix.app }} && zip -qr ../../../eqosy-${{ matrix.app }}-ios.zip ios -x "ios/App/Pods/*"
+        run: cd apps/${{ matrix.app }} && zip -qr ../../eqosy-${{ matrix.app }}-ios.zip ios -x "ios/App/Pods/*"
 
       - uses: actions/upload-artifact@v4
         with:

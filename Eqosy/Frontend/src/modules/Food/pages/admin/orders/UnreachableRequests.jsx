@@ -1,0 +1,373 @@
+import React, { useCallback, useEffect, useState } from "react";
+import { PhoneOff, RefreshCw, Store, User, Bike, Check, X, Loader2, Leaf } from "lucide-react";
+import { toast } from "sonner";
+import { adminAPI } from "@food/api";
+
+const unwrapRows = (res) => {
+  const data = res?.data?.data || res?.data || res;
+  const rows = data?.orders || data?.items || (Array.isArray(data) ? data : []);
+  return Array.isArray(rows) ? rows : [];
+};
+
+const timeAgo = (value) => {
+  if (!value) return "";
+  const mins = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60000));
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  return `${Math.floor(mins / 60)} h ${mins % 60} min ago`;
+};
+
+/**
+ * Admin: the delivery partner could not reach the customer and wants to bring the food back to the restaurant.
+ * Approve (optionally with a penalty that is charged on the customer's next order) or reject.
+ */
+export default function UnreachableRequests() {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [active, setActive] = useState(null); // order being decided
+  const [mode, setMode] = useState("approve"); // approve | reject
+  const [penalty, setPenalty] = useState("");
+  const [rescuePrice, setRescuePrice] = useState("");
+  const [rescuePct, setRescuePct] = useState("");
+  const [returnPct, setReturnPct] = useState("");
+  const [note, setNote] = useState("");
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setRows(unwrapRows(await adminAPI.getPendingUndeliveredReturns()));
+    } catch (err) {
+      toast.error(err?.response?.data?.message || "Could not load requests");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 15000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  // New request while this page is open.
+  useEffect(() => {
+    const onNew = () => load();
+    window.addEventListener("admin_undelivered_request", onNew);
+    return () => window.removeEventListener("admin_undelivered_request", onNew);
+  }, [load]);
+
+  const openDialog = (order, nextMode) => {
+    setActive(order);
+    setMode(nextMode);
+    setPenalty("");
+    setNote("");
+    setReason("");
+    setRescuePrice(String(order?.rescueOption?.defaultPrice ?? ""));
+    setRescuePct(String(order?.rescueOption?.penaltyPercent ?? ""));
+    // COD return: suggest the configured % of the food value; the admin can change either the % or the amount.
+    const food = Number(order?.rescueOption?.foodValue ?? order?.pricing?.subtotal ?? 0);
+    const retPct = Number(order?.rescueOption?.returnPenaltyPercent ?? 0);
+    setReturnPct(String(retPct));
+    setPenalty(retPct > 0 && food > 0 ? String(Math.round((food * retPct) / 100)) : "");
+  };
+
+  const closeDialog = () => {
+    if (!submitting) setActive(null);
+  };
+
+  const submit = async () => {
+    if (!active) return;
+    const orderKey = active._id || active.orderMongoId;
+    setSubmitting(true);
+    try {
+      if (mode === "rescue") {
+        const price = Number(rescuePrice);
+        const max = Number(active.rescueOption?.foodValue ?? Infinity);
+        if (!Number.isFinite(price) || price <= 0 || price > max) {
+          toast.error(`Enter a food price between 1 and Rs ${max}`);
+          setSubmitting(false);
+          return;
+        }
+        await adminAPI.rescueUndeliveredOrder(orderKey, { rescuePrice: price, penaltyPercent: rescuePct === "" ? undefined : Number(rescuePct), note: note.trim() });
+        toast.success("Sent to Food Rescue. Customers in this zone are being notified.");
+      } else if (mode === "approve") {
+        const amount = Number(penalty || 0);
+        if (!Number.isFinite(amount) || amount < 0) {
+          toast.error("Enter a valid penalty amount");
+          setSubmitting(false);
+          return;
+        }
+        await adminAPI.approveUndeliveredReturn(orderKey, { penaltyAmount: amount, note: note.trim() });
+        toast.success(
+          amount > 0
+            ? `Approved. Rs ${amount} penalty will be charged on the customer's next order.`
+            : "Approved. The delivery partner is returning the food to the restaurant.",
+        );
+      } else {
+        await adminAPI.rejectUndeliveredReturn(orderKey, reason.trim());
+        toast.success("Request rejected. The delivery partner was informed.");
+      }
+      setActive(null);
+      await load();
+    } catch (err) {
+      toast.error(err?.response?.data?.message || "Action failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="p-4 lg:p-8 max-w-5xl mx-auto">
+      <div className="flex items-center justify-between gap-3 mb-6">
+        <div className="flex items-center gap-3">
+          <div className="w-11 h-11 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center">
+            <PhoneOff className="w-5 h-5" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold text-slate-900">Customer Unreachable Requests</h1>
+            <p className="text-sm text-slate-500">
+              Approve to send the food back to the restaurant. The delivery partner still gets their earning.
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => { setLoading(true); load(); }}
+          className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+        >
+          <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} /> Refresh
+        </button>
+      </div>
+
+      {loading && rows.length === 0 ? (
+        <div className="py-20 text-center text-slate-400">
+          <Loader2 className="w-6 h-6 animate-spin mx-auto" />
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-slate-200 bg-white py-16 text-center">
+          <p className="text-sm font-semibold text-slate-500">No pending requests</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {rows.map((order) => {
+            const ret = order.undeliveredReturn || {};
+            const partner = ret.requestedBy && typeof ret.requestedBy === "object" ? ret.requestedBy : {};
+            const restaurant = order.restaurantId && typeof order.restaurantId === "object" ? order.restaurantId : {};
+            const user = order.userId && typeof order.userId === "object" ? order.userId : {};
+            const customerPhone = user.phone || order.customerPhone || order.deliveryAddress?.phone || "";
+            return (
+              <div key={order._id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-base font-bold text-slate-900">Order #{order.order_id || order._id}</p>
+                    <p className="text-xs text-slate-500">Requested {timeAgo(ret.requestedAt)}</p>
+                  </div>
+                  <span className="rounded-full bg-amber-50 border border-amber-200 px-3 py-1 text-xs font-bold text-amber-800">
+                    Approval needed
+                  </span>
+                </div>
+
+                <div className="mt-4 grid gap-3 sm:grid-cols-3 text-sm">
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400"><Bike className="w-3.5 h-3.5" /> Delivery partner</p>
+                    <p className="mt-1 font-semibold text-slate-900">{partner.name || partner.fullName || "Delivery Partner"}</p>
+                    {partner.phone ? <a href={`tel:${partner.phone}`} className="text-xs font-semibold text-blue-600">{partner.phone}</a> : null}
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400"><User className="w-3.5 h-3.5" /> Customer</p>
+                    <p className="mt-1 font-semibold text-slate-900">{user.name || user.fullName || order.customerName || "Customer"}</p>
+                    {customerPhone ? <a href={`tel:${customerPhone}`} className="text-xs font-semibold text-blue-600">{customerPhone}</a> : null}
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <p className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-400"><Store className="w-3.5 h-3.5" /> Restaurant</p>
+                    <p className="mt-1 font-semibold text-slate-900">{restaurant.restaurantName || restaurant.name || "Restaurant"}</p>
+                    {restaurant.phone ? <a href={`tel:${restaurant.phone}`} className="text-xs font-semibold text-blue-600">{restaurant.phone}</a> : null}
+                  </div>
+                </div>
+
+                <p className="mt-3 text-sm text-slate-700">
+                  <span className="font-semibold">Reason:</span> {ret.reason || "Customer not answering calls"}
+                  {ret.note ? ` (${ret.note})` : ""}
+                </p>
+                <p className="mt-1 text-sm text-slate-700">
+                  <span className="font-semibold">Order total:</span> Rs {order.pricing?.total ?? "-"}
+                  {" • "}
+                  <span className="font-semibold">Payment:</span> {String(order.payment?.method || "").toUpperCase()} ({order.payment?.status || "-"})
+                  {" • "}
+                  <span className="font-semibold">Rider earning:</span> Rs {order.riderEarning ?? 0}
+                </p>
+
+                <div className="mt-4 flex flex-wrap gap-3">
+                  <button
+                    type="button"
+                    onClick={() => openDialog(order, "approve")}
+                    className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700"
+                  >
+                    <Check className="w-4 h-4" /> Approve return
+                  </button>
+                  {order.rescueOption?.eligible ? (
+                    <button
+                      type="button"
+                      onClick={() => openDialog(order, "rescue")}
+                      className="inline-flex items-center gap-2 rounded-xl bg-orange-500 px-4 py-2.5 text-sm font-bold text-white hover:bg-orange-600"
+                    >
+                      <Leaf className="w-4 h-4" /> Send to Food Rescue
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => openDialog(order, "reject")}
+                    className="inline-flex items-center gap-2 rounded-xl border border-rose-200 bg-white px-4 py-2.5 text-sm font-bold text-rose-600 hover:bg-rose-50"
+                  >
+                    <X className="w-4 h-4" /> Reject
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {active ? (
+        <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/50 p-4" onClick={closeDialog}>
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            {mode === "rescue" ? (
+              <>
+                <h2 className="text-lg font-bold text-slate-900">Send to Food Rescue</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Order #{active.order_id || active._id} is prepaid. The customer gets the normal cancellation charge (cut from their payment, the rest is refunded).
+                  Customers near the delivery partner are notified, and the same delivery partner delivers it to the buyer.
+                </p>
+                <label className="mt-5 block text-sm font-semibold text-slate-700">
+                  Rescue food price (Rs)
+                  <input
+                    type="number"
+                    min="1"
+                    max={active.rescueOption?.foodValue}
+                    step="1"
+                    value={rescuePrice}
+                    onChange={(e) => setRescuePrice(e.target.value)}
+                    className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-orange-500"
+                  />
+                </label>
+                <p className="mt-1 text-xs text-slate-500">
+                  Original food value Rs {active.rescueOption?.foodValue}. Suggested Rs {active.rescueOption?.defaultPrice} ({active.rescueOption?.discountPercent}% off). Delivery fee and taxes are added on top for the buyer.
+                </p>
+                <label className="mt-4 block text-sm font-semibold text-slate-700">
+                  Customer penalty (% of food value)
+                  <input
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={rescuePct}
+                    onChange={(e) => setRescuePct(e.target.value)}
+                    className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-orange-500"
+                  />
+                </label>
+                <p className="mt-1 text-xs text-slate-500">
+                  Food penalty ≈ Rs {Math.round(((Number(active.rescueOption?.foodValue) || 0) * (Number(rescuePct) || 0)) / 100)}, plus the delivery fee, platform fee, cancellation fee and GST set in Rules. It is taken from the customer's payment right away and the rest is refunded.
+                </p>
+                <label className="mt-4 block text-sm font-semibold text-slate-700">
+                  Note (optional)
+                  <input
+                    type="text"
+                    value={note}
+                    onChange={(e) => setNote(e.target.value)}
+                    className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-orange-500"
+                  />
+                </label>
+              </>
+            ) : mode === "approve" ? (
+              <>
+                <h2 className="text-lg font-bold text-slate-900">Approve return to restaurant</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Order #{active.order_id || active._id}. The restaurant will get an OTP, the delivery partner keeps their earning.
+                </p>
+                <div className="mt-5 grid grid-cols-2 gap-3">
+                  <label className="block text-sm font-semibold text-slate-700">
+                    Penalty (% of food)
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="1"
+                      value={returnPct}
+                      onChange={(e) => {
+                        setReturnPct(e.target.value);
+                        const food = Number(active.rescueOption?.foodValue ?? active.pricing?.subtotal ?? 0);
+                        setPenalty(String(Math.round((food * (Number(e.target.value) || 0)) / 100)));
+                      }}
+                      className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-emerald-500"
+                    />
+                  </label>
+                  <label className="block text-sm font-semibold text-slate-700">
+                    Penalty (Rs)
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={penalty}
+                      onChange={(e) => setPenalty(e.target.value)}
+                      placeholder="0 = no penalty"
+                      className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-emerald-500"
+                    />
+                  </label>
+                </div>
+                <p className="mt-1 text-xs text-slate-500">
+                  Charged on the same customer's next order (they cannot use Cash on Delivery until it is paid). Food value Rs {active.rescueOption?.foodValue ?? active.pricing?.subtotal ?? "-"}. Set 0 for no penalty.
+                </p>
+                <label className="mt-4 block text-sm font-semibold text-slate-700">
+                  Note (optional)
+                  <input
+                    type="text"
+                    value={note}
+                    onChange={(e) => setNote(e.target.value)}
+                    className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-emerald-500"
+                  />
+                </label>
+              </>
+            ) : (
+              <>
+                <h2 className="text-lg font-bold text-slate-900">Reject request</h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  The delivery partner will be told to keep trying to reach the customer.
+                </p>
+                <label className="mt-5 block text-sm font-semibold text-slate-700">
+                  Reason
+                  <input
+                    type="text"
+                    value={reason}
+                    onChange={(e) => setReason(e.target.value)}
+                    placeholder="e.g. Customer just replied, please deliver"
+                    className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-rose-500"
+                  />
+                </label>
+              </>
+            )}
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeDialog}
+                disabled={submitting}
+                className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={submit}
+                disabled={submitting}
+                className={`inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-bold text-white disabled:opacity-60 ${mode === "approve" ? "bg-emerald-600 hover:bg-emerald-700" : mode === "rescue" ? "bg-orange-500 hover:bg-orange-600" : "bg-rose-600 hover:bg-rose-700"}`}
+              >
+                {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                {mode === "approve" ? "Approve" : mode === "rescue" ? "Start Food Rescue" : "Reject"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
