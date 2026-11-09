@@ -1,0 +1,14 @@
+{
+  "name": "eqosy-ios-user",
+  "private": true,
+  "dependencies": {
+    "@capacitor/core": "*",
+    "@capacitor/ios": "*",
+    "@capacitor/android": "*",
+    "@capacitor-firebase/messaging": "*",
+    "@capacitor/splash-screen": "*",
+    "@capacitor/haptics": "*",
+    "@capacitor/camera": "*",
+    "@capacitor/keyboard": "*"
+  }
+}

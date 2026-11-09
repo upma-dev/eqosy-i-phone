@@ -1,0 +1,5 @@
+{
+  "user":    { "name": "Eqosy",         "appId": "com.eqosy.user",    "startPath": "/",                  "background": ["remote-notification", "audio"] },
+  "driver":  { "name": "Eqosy Driver",  "appId": "com.eqosy.driver",  "startPath": "/taxi/driver/login", "background": ["remote-notification", "audio", "location"] },
+  "partner": { "name": "Eqosy Partner", "appId": "com.eqosy.partner", "startPath": "/food/restaurant",   "background": ["remote-notification", "audio"] }
+}

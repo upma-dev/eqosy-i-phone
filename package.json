@@ -1,0 +1,29 @@
+{
+  "name": "eqosy-iphone",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "user": "node scripts/ios.mjs user",
+    "driver": "node scripts/ios.mjs driver",
+    "partner": "node scripts/ios.mjs partner",
+    "all": "node scripts/ios.mjs user && node scripts/ios.mjs driver && node scripts/ios.mjs partner",
+    "user:android": "node scripts/ios.mjs user android",
+    "driver:android": "node scripts/ios.mjs driver android",
+    "partner:android": "node scripts/ios.mjs partner android"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.6.0"
+  },
+  "dependencies": {
+    "@capacitor-firebase/messaging": "^8.6.0",
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/camera": "^8.2.6",
+    "@capacitor/core": "^8.6.0",
+    "@capacitor/haptics": "^8.0.2",
+    "@capacitor/ios": "^8.6.0",
+    "@capacitor/keyboard": "^8.0.6",
+    "@capacitor/splash-screen": "^8.0.2",
+    "firebase": "^12.19.0"
+  }
+}

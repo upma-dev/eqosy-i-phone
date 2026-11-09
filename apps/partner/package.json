@@ -1,0 +1,13 @@
+{
+  "name": "eqosy-ios-partner",
+  "private": true,
+  "dependencies": {
+    "@capacitor/core": "*",
+    "@capacitor/ios": "*",
+    "@capacitor-firebase/messaging": "*",
+    "@capacitor/splash-screen": "*",
+    "@capacitor/haptics": "*",
+    "@capacitor/camera": "*",
+    "@capacitor/keyboard": "*"
+  }
+}
