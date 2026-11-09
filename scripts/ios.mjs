@@ -39,7 +39,7 @@ const envVars = Object.fromEntries(
 );
 
 // 2) build the web app from ../Eqosy/Frontend (original code, untouched)
-const frontend = path.resolve(root, '../Eqosy/Frontend');
+const frontend = path.resolve(root, 'Eqosy/Frontend');
 run(
   'node',
   [`"${path.join(frontend, 'node_modules/vite/bin/vite.js')}"`, 'build', '--config', `"${path.join(root, 'vite.config.mjs')}"`],

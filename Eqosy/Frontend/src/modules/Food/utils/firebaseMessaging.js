@@ -1,0 +1,1042 @@
+import { toast } from "sonner";
+import { userAPI, restaurantAPI, deliveryAPI, adminAPI } from "@food/api";
+import { initializeApp, getApp, getApps } from "firebase/app";
+import fallbackNotificationSound from "@food/assets/audio/alert.mp3";
+import { playChatNotificationSound } from "@/shared/utils/chatNotificationSound";
+
+const pushNotificationSoundPath = "/zomato_sms.mp3";
+
+const DEFAULT_FIREBASE_CONFIG = {
+  apiKey: "",
+  authDomain: "",
+  projectId: "",
+  appId: "",
+  messagingSenderId: "",
+};
+
+const tokenCachePrefix = "fcm_web_registered_token_";
+const pushSoundEnabledStorageKey = "push_sound_enabled";
+let publicEnvPromise = null;
+let foregroundListenerAttached = false;
+let registrationInFlight = null;
+let serviceWorkerMessageListenerAttached = false;
+const MESSAGING_APP_NAME = "web-push-app";
+const recentForegroundNotifications = new Map();
+let pushSoundAudio = null;
+let pushSoundUnlocked = false;
+let pushSoundContext = null;
+const PUSH_DEBUG_PREFIX = "[push-debug]";
+const notificationDedupWindowMs = 8000;
+const pushDebugLog = (prefix, message, data = {}) => {
+  console.log(`${prefix} ${message}`, data);
+};
+const pushDebugWarn = (prefix, message, data = {}) => {
+  console.warn(`${prefix} ${message}`, data);
+};
+
+function normalizeModuleFromPath(pathname = window.location.pathname) {
+  if (pathname.includes("/restaurant") && !pathname.includes("/restaurants")) return "restaurant";
+  if (pathname.includes("/delivery")) return "delivery";
+  if (pathname.includes("/admin")) return "admin";
+  return "user";
+}
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function getPushSoundSources(moduleName = normalizeModuleFromPath()) {
+  // Delivery and restaurant should always use the alert tone for FCM pushes.
+  if (moduleName === "delivery" || moduleName === "restaurant") {
+    return [fallbackNotificationSound];
+  }
+  return [pushNotificationSoundPath, fallbackNotificationSound];
+}
+
+function isSupportedBrowser() {
+  return (
+    typeof window !== "undefined" &&
+    "Notification" in window &&
+    "serviceWorker" in navigator &&
+    "PushManager" in window
+  );
+}
+
+function isFlutterWebView() {
+  return (
+    typeof window !== "undefined" &&
+    Boolean(window.flutter_inappwebview) &&
+    typeof window.flutter_inappwebview.callHandler === "function"
+  );
+}
+
+function normalizeFcmToken(value) {
+  const token =
+    typeof value === "string"
+      ? value
+      : value?.token || value?.fcmToken || value?.data?.token || value?.data?.fcmToken || "";
+  return String(token).trim();
+}
+
+function isSecureContextForPush() {
+  return window.isSecureContext || window.location.hostname === "localhost";
+}
+
+function sanitize(value) {
+  return String(value || "").trim().replace(/^['"]|['"]$/g, "");
+}
+
+function getNotificationKey(payload = {}) {
+  return (
+    payload?.data?.notificationId ||
+    payload?.data?.messageId ||
+    payload?.messageId ||
+    [
+      payload?.notification?.title || "",
+      payload?.notification?.body || "",
+      payload?.data?.orderId || "",
+      payload?.data?.targetUrl || "",
+    ].join("::")
+  );
+}
+
+function wasRecentlyHandled(notificationKey) {
+  if (!notificationKey) return false;
+  const now = Date.now();
+
+  for (const [key, timestamp] of recentForegroundNotifications.entries()) {
+    if (now - timestamp > notificationDedupWindowMs) {
+      recentForegroundNotifications.delete(key);
+    }
+  }
+
+  if (recentForegroundNotifications.has(notificationKey)) {
+    pushDebugLog(PUSH_DEBUG_PREFIX, "Duplicate notification skipped", { notificationKey });
+    return true;
+  }
+
+  recentForegroundNotifications.set(notificationKey, now);
+  return false;
+}
+
+function ensurePushSoundAudio() {
+  if (typeof window === "undefined") return null;
+  if (!pushSoundAudio) {
+    const [primarySource] = getPushSoundSources();
+    const audioUrl = primarySource.startsWith("/")
+      ? new URL(primarySource, window.location.origin).toString()
+      : primarySource;
+    pushDebugLog(PUSH_DEBUG_PREFIX, "Creating primary push audio", { audioUrl });
+    pushSoundAudio = new Audio(audioUrl);
+    pushSoundAudio.preload = "auto";
+    pushSoundAudio.volume = 1;
+    pushSoundAudio.load();
+  }
+  return pushSoundAudio;
+}
+
+function createPushPlaybackAudio() {
+  const moduleName = normalizeModuleFromPath();
+  const audioSources = getPushSoundSources(moduleName).map((source) =>
+    typeof window === "undefined" || !source.startsWith("/")
+      ? source
+      : new URL(source, window.location.origin).toString(),
+  );
+  pushDebugLog(PUSH_DEBUG_PREFIX, "Preparing push playback sources", { audioSources });
+  return audioSources.map((source) => {
+    const playbackAudio = new Audio(source);
+    playbackAudio.preload = "auto";
+    playbackAudio.volume = 1;
+    playbackAudio.load();
+    return playbackAudio;
+  });
+}
+
+function getAudioContext() {
+  if (typeof window === "undefined") return null;
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return null;
+
+  if (!pushSoundContext) {
+    pushSoundContext = new AudioContextClass();
+  }
+
+  return pushSoundContext;
+}
+
+async function playSynthNotificationBeep() {
+  const ctx = getAudioContext();
+  if (!ctx) return false;
+  pushDebugLog(PUSH_DEBUG_PREFIX, "Playing synth notification beep");
+
+  if (ctx.state === "suspended") {
+    await ctx.resume();
+  }
+
+  const now = ctx.currentTime;
+  const pulses = [
+    { start: 0, duration: 0.11, frequency: 880 },
+    { start: 0.16, duration: 0.11, frequency: 988 },
+    { start: 0.34, duration: 0.18, frequency: 1046 },
+  ];
+
+  pulses.forEach(({ start, duration, frequency }) => {
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(frequency, now + start);
+    gain.gain.setValueAtTime(0.0001, now + start);
+    gain.gain.exponentialRampToValueAtTime(0.18, now + start + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + start + duration);
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+    oscillator.start(now + start);
+    oscillator.stop(now + start + duration);
+  });
+
+  return true;
+}
+
+export function isPushSoundEnabled() {
+  if (typeof window === "undefined") return false;
+  return localStorage.getItem(pushSoundEnabledStorageKey) === "true";
+}
+
+async function triggerWebViewNativeNotification(payload = {}) {
+  if (typeof window === "undefined") return false;
+
+  const bridgePayload = {
+    title: payload?.notification?.title || payload?.data?.title || "New notification",
+    body: payload?.notification?.body || payload?.data?.body || "",
+    notificationId: payload?.data?.notificationId || payload?.messageId || "",
+    targetUrl: payload?.data?.targetUrl || payload?.data?.link || "",
+    imageUrl: payload?.notification?.image || payload?.data?.image || payload?.data?.imageUrl || "",
+  };
+
+  try {
+    if (
+      window.flutter_inappwebview &&
+      typeof window.flutter_inappwebview.callHandler === "function"
+    ) {
+      const handlerNames = [
+        "playNotificationSound",
+        "triggerNotificationFeedback",
+        "onPushNotification",
+      ];
+
+      for (const handlerName of handlerNames) {
+        try {
+          pushDebugLog(PUSH_DEBUG_PREFIX, "Trying native notification handler", { handlerName, bridgePayload });
+          await window.flutter_inappwebview.callHandler(handlerName, bridgePayload);
+          pushDebugLog(PUSH_DEBUG_PREFIX, "Native notification handler succeeded", { handlerName });
+          return true;
+        } catch {
+          // Try the next available handler name.
+        }
+      }
+    }
+  } catch {
+    // Ignore bridge failures.
+  }
+
+  return false;
+}
+
+export function isPushRingEvent(payload = {}) {
+  const data = payload?.data || {};
+  const type = String(data.type || payload.type || payload.category || '').toLowerCase();
+  const chatType = String(data.chatType || payload.chatType || '').toLowerCase();
+  const title = String(payload.title || payload.notification?.title || '').toLowerCase();
+  const body = String(payload.body || payload.notification?.body || '').toLowerCase();
+  const sound = String(payload.sound || data.sound || '').toLowerCase();
+  const moduleName = normalizeModuleFromPath();
+
+  // GUARD: Never ring if the user is on an auth / login / welcome screen or logged out
+  const currentPath = typeof window !== 'undefined' ? String(window.location.pathname || '').toLowerCase() : '';
+  const isAuthScreen = currentPath.includes('/login') || currentPath.includes('/auth/') || currentPath.includes('/welcome');
+  if (isAuthScreen) {
+    return false;
+  }
+
+  // 1. EXPLICIT GUARD: Chat messages must NEVER trigger loud order ringtone or alert loop
+  if (
+    type === 'chat_message' ||
+    type.includes('chat') ||
+    chatType.includes('chat') ||
+    title.includes('message') ||
+    Boolean(data.conversationId) ||
+    data.openChat === 'true'
+  ) {
+    return false;
+  }
+
+  // 2. EXPLICIT GUARD: Status updates (Order Status Update, Food Ready, Preparing, Pickup, Arrived, Delivered, Cancelled)
+  // must show notifications but NEVER play loud order ringtone!
+  if (
+    type.includes('rider_arrived') ||
+    type.includes('partner_arrived') ||
+    type.includes('reached_pickup') ||
+    type.includes('picked_up') ||
+    type.includes('out_for_delivery') ||
+    type.includes('reached_drop') ||
+    type.includes('at_drop') ||
+    type.includes('delivered') ||
+    type.includes('order_completed') ||
+    type.includes('order_status_update') ||
+    type.includes('status_update') ||
+    type.includes('order_ready') ||
+    type.includes('ready_for_pickup') ||
+    type.includes('completed') ||
+    type.includes('cancel') ||
+    title.includes('ready') ||
+    title.includes('prepared') ||
+    title.includes('completed') ||
+    title.includes('delivered') ||
+    title.includes('arrived') ||
+    title.includes('picked') ||
+    title.includes('cancelled') ||
+    title.includes('updated')
+  ) {
+    return false;
+  }
+
+  // 3. EXPLICIT GUARD: Delivery Partner dispatch/request pushes (e.g. "New order request! 🛵")
+  const isDeliveryRequest =
+    title.includes('request') ||
+    title.includes('nearby') ||
+    body.includes('accept now') ||
+    type.includes('order_assigned') ||
+    type.includes('order_assign') ||
+    type.includes('delivery_assigned') ||
+    type.includes('gig_reminder');
+
+  if (isDeliveryRequest) {
+    // Delivery requests should ONLY ring when the app is currently in the delivery module AND authenticated!
+    if (moduleName !== 'delivery') {
+      return false;
+    }
+    const deliveryToken = typeof localStorage !== 'undefined' ? localStorage.getItem('delivery_accessToken') : null;
+    if (!deliveryToken) {
+      return false;
+    }
+
+    // Extra guard for gig_reminder: check if partner already dismissed it
+    if (type.includes('gig_reminder')) {
+      const gigId = data?.bookingId || data?.gigId || payload?.gigId || '';
+      const GIG_DISMISS_PREFIX = 'gig_reminder_dismissed_';
+      if (gigId) {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(GIG_DISMISS_PREFIX) && k.includes(String(gigId))) {
+              const val = localStorage.getItem(k);
+              if (val) {
+                const ts = new Date(val).getTime();
+                if (!isNaN(ts) && Date.now() - ts <= 24 * 60 * 60 * 1000) {
+                  return false;
+                }
+              }
+            }
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    return true;
+  }
+
+  // 4. Restaurant / User New Order or Dining Reservation Ring Event
+  const isRestaurantNewOrder =
+    type.includes('new_order') ||
+    type.includes('order_created') ||
+    type.includes('place_order') ||
+    type.includes('new_dining') ||
+    type.includes('dining_booking') ||
+    type.includes('new_reservation') ||
+    type.includes('table_booking') ||
+    type.includes('dining_order') ||
+    title.includes('new order') ||
+    title.includes('order received') ||
+    title.includes('new reservation') ||
+    title.includes('table booking') ||
+    title.includes('new dining');
+
+  if (isRestaurantNewOrder) {
+    // If we're currently in the delivery module, restaurant new order should NOT ring the driver!
+    if (moduleName === 'delivery') {
+      return false;
+    }
+    // "order_created" is the customer's own confirmation push — never ring a restaurant tab for it.
+    if (moduleName === 'restaurant' && type.includes('order_created')) {
+      return false;
+    }
+    if (moduleName === 'restaurant') {
+      const restToken = typeof localStorage !== 'undefined' ? localStorage.getItem('restaurant_accessToken') : null;
+      if (!restToken) {
+        return false;
+      }
+    }
+    if (isPushForOtherRestaurant(payload)) {
+      return false;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+async function playPushSound(payload = {}) {
+  try {
+    pushDebugLog(PUSH_DEBUG_PREFIX, "playPushSound called", {
+      notificationKey: getNotificationKey(payload),
+      pushSoundUnlocked,
+      notificationPermission: typeof Notification !== "undefined" ? Notification.permission : "unsupported",
+      payload,
+    });
+
+    const data = payload?.data || {};
+    const type = String(data.type || payload.type || payload.category || '').toLowerCase();
+    const chatType = String(data.chatType || payload.chatType || '').toLowerCase();
+    const title = String(payload.title || payload.notification?.title || '').toLowerCase();
+
+    const isChat =
+      type === 'chat_message' ||
+      type.includes('chat') ||
+      chatType.includes('chat') ||
+      title.includes('message') ||
+      Boolean(data.conversationId) ||
+      data.openChat === 'true';
+
+    if (isChat) {
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Push notification is a chat message, playing soft chat chime", { payload });
+      playChatNotificationSound();
+      return;
+    }
+
+    if (!isPushRingEvent(payload)) {
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Push notification is a silent status update, skipping sound audio", { payload });
+      return;
+    }
+
+    const usedNativeBridge = await triggerWebViewNativeNotification(payload);
+
+    if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Triggering vibration");
+      navigator.vibrate([200, 100, 200, 100, 300]);
+    }
+
+    if (usedNativeBridge) {
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Push sound handled by native bridge");
+      return;
+    }
+
+    if (!pushSoundUnlocked) {
+      pushDebugWarn(PUSH_DEBUG_PREFIX, "Push sound blocked because sound is not enabled/unlocked");
+      return;
+    }
+
+    const players = createPushPlaybackAudio();
+    for (const audio of players) {
+      try {
+        audio.currentTime = 0;
+        await audio.play();
+        pushDebugLog(PUSH_DEBUG_PREFIX, "Audio playback succeeded", { source: audio.src });
+        return;
+      } catch (error) {
+        pushDebugWarn(PUSH_DEBUG_PREFIX, "Audio playback failed", {
+          source: audio.src,
+          error: error?.message || error,
+        });
+        // Try next fallback sound source.
+      }
+    }
+
+    await playSynthNotificationBeep();
+  } catch (error) {
+    pushDebugWarn(PUSH_DEBUG_PREFIX, "playPushSound failed", { error: error?.message || error });
+  }
+}
+
+function setupPushSoundUnlock() {
+  if (typeof window === "undefined" || pushSoundUnlocked) return;
+
+  const unlock = async () => {
+    let audio = null;
+    try {
+      audio = ensurePushSoundAudio();
+      if (!audio) return;
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Attempting passive push sound unlock");
+      audio.muted = true;
+      await audio.play();
+      audio.pause();
+      audio.currentTime = 0;
+      pushSoundUnlocked = true;
+      localStorage.setItem(pushSoundEnabledStorageKey, "true");
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Passive push sound unlock succeeded");
+      window.dispatchEvent(new CustomEvent("push-sound-enabled"));
+    } catch (error) {
+      pushDebugWarn(PUSH_DEBUG_PREFIX, "Passive push sound unlock failed", {
+        error: error?.message || error,
+      });
+    } finally {
+      if (audio) {
+        audio.muted = false;
+      }
+    }
+
+    if (pushSoundUnlocked) {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+      window.removeEventListener("touchstart", unlock);
+    }
+  };
+
+  window.addEventListener("pointerdown", unlock, { passive: true });
+  window.addEventListener("keydown", unlock, { passive: true });
+  window.addEventListener("touchstart", unlock, { passive: true });
+}
+
+export async function enablePushNotificationSound() {
+  if (typeof window === "undefined") return false;
+
+  let audio = null;
+  try {
+    audio = ensurePushSoundAudio();
+    if (!audio) return false;
+    pushDebugLog(PUSH_DEBUG_PREFIX, "Manual push sound enable started");
+    audio.muted = true;
+    await audio.play();
+    audio.pause();
+    audio.currentTime = 0;
+    pushSoundUnlocked = true;
+    localStorage.setItem(pushSoundEnabledStorageKey, "true");
+    window.dispatchEvent(new CustomEvent("push-sound-enabled"));
+
+    const players = createPushPlaybackAudio();
+    for (const previewAudio of players) {
+      try {
+        previewAudio.currentTime = 0;
+        await previewAudio.play();
+        pushDebugLog(PUSH_DEBUG_PREFIX, "Manual sound preview succeeded", { source: previewAudio.src });
+        return true;
+      } catch (error) {
+        pushDebugWarn(PUSH_DEBUG_PREFIX, "Manual sound preview failed", {
+          source: previewAudio.src,
+          error: error?.message || error,
+        });
+        // Try next preview source.
+      }
+    }
+
+    await playSynthNotificationBeep();
+    return true;
+  } catch (error) {
+    pushDebugWarn(PUSH_DEBUG_PREFIX, "Manual push sound enable failed, trying synth beep", {
+      error: error?.message || error,
+    });
+    try {
+      await playSynthNotificationBeep();
+      pushSoundUnlocked = true;
+      localStorage.setItem(pushSoundEnabledStorageKey, "true");
+      window.dispatchEvent(new CustomEvent("push-sound-enabled"));
+    }
+    catch (beepError) {
+      pushDebugWarn(PUSH_DEBUG_PREFIX, "Synth beep fallback failed", {
+        error: beepError?.message || beepError,
+      });
+      return false;
+    }
+    return true;
+  } finally {
+    if (audio) {
+      audio.muted = false;
+    }
+  }
+}
+
+async function getFirebasePublicEnv() {
+  if (publicEnvPromise) return publicEnvPromise;
+
+  publicEnvPromise = (async () => {
+    try {
+      return {
+        apiKey: sanitize(import.meta.env.VITE_FIREBASE_API_KEY) || DEFAULT_FIREBASE_CONFIG.apiKey,
+        authDomain: sanitize(import.meta.env.VITE_FIREBASE_AUTH_DOMAIN) || DEFAULT_FIREBASE_CONFIG.authDomain,
+        projectId: sanitize(import.meta.env.VITE_FIREBASE_PROJECT_ID) || DEFAULT_FIREBASE_CONFIG.projectId,
+        appId: sanitize(import.meta.env.VITE_FIREBASE_APP_ID) || DEFAULT_FIREBASE_CONFIG.appId,
+        messagingSenderId:
+          sanitize(import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID) || DEFAULT_FIREBASE_CONFIG.messagingSenderId,
+        storageBucket: sanitize(import.meta.env.VITE_FIREBASE_STORAGE_BUCKET),
+        measurementId: sanitize(import.meta.env.VITE_FIREBASE_MEASUREMENT_ID),
+        vapidKey: sanitize(import.meta.env.VITE_FIREBASE_VAPID_KEY),
+      };
+    } catch {
+      return {
+        ...DEFAULT_FIREBASE_CONFIG,
+        storageBucket: sanitize(import.meta.env.VITE_FIREBASE_STORAGE_BUCKET),
+        measurementId: sanitize(import.meta.env.VITE_FIREBASE_MEASUREMENT_ID),
+        vapidKey: sanitize(import.meta.env.VITE_FIREBASE_VAPID_KEY),
+      };
+    } finally {
+      publicEnvPromise = null;
+    }
+  })();
+
+  return publicEnvPromise;
+}
+
+function getMessagingFirebaseApp(config) {
+  const appConfig = {
+    apiKey: config.apiKey,
+    authDomain: config.authDomain,
+    projectId: config.projectId,
+    appId: config.appId,
+    messagingSenderId: config.messagingSenderId,
+    ...(config.storageBucket ? { storageBucket: config.storageBucket } : {}),
+    ...(config.measurementId ? { measurementId: config.measurementId } : {}),
+  };
+
+  if (!appConfig.apiKey || !appConfig.projectId || !appConfig.appId || !appConfig.messagingSenderId) {
+    return null;
+  }
+
+  const existing = getApps().find((a) => a.name === MESSAGING_APP_NAME);
+  if (existing) return existing;
+
+  try {
+    return getApp(MESSAGING_APP_NAME);
+  } catch {
+    return initializeApp(appConfig, MESSAGING_APP_NAME);
+  }
+}
+
+function setSavedToken(moduleName, token) {
+  localStorage.setItem(`${tokenCachePrefix}${moduleName}`, token);
+}
+
+async function saveTokenByModule(moduleName, token, platform = "web") {
+  pushDebugLog(PUSH_DEBUG_PREFIX, "saveTokenByModule starting", { moduleName, platform });
+  if (moduleName === "restaurant") {
+    await restaurantAPI.saveFcmToken(token, platform);
+    return;
+  }
+  if (moduleName === "delivery") {
+    await deliveryAPI.saveFcmToken(token, platform);
+    return;
+  }
+  if (moduleName === "user") {
+    await userAPI.saveFcmToken(token, { platform });
+    return;
+  }
+  if (moduleName === "admin") {
+    await adminAPI.saveFcmToken(token, platform);
+    return;
+  }
+}
+
+async function registerNativeWebViewFcmToken(moduleName) {
+  if (!isFlutterWebView()) return;
+
+  const handlerNames = ["getFcmToken", "getFCMToken", "getPushToken", "getFirebaseToken"];
+  for (const handlerName of handlerNames) {
+    try {
+      const response = await window.flutter_inappwebview.callHandler(handlerName, {
+        module: moduleName,
+      });
+      const normalizedToken = normalizeFcmToken(response);
+      if (normalizedToken.length < 20) continue;
+
+      await saveTokenByModule(moduleName, normalizedToken, "mobile");
+      setSavedToken(moduleName, normalizedToken);
+
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Registered native WebView FCM token", {
+        moduleName,
+        handlerName,
+      });
+      return;
+    } catch {
+      // Try next handler.
+    }
+  }
+}
+
+// A restaurant tab must never show/ring pushes addressed to a different restaurant
+// (web FCM tokens are per browser, so several restaurant logins can share one device).
+function isPushForOtherRestaurant(payload = {}) {
+  if (normalizeModuleFromPath() !== "restaurant") return false;
+  const targetId = String(payload?.data?.restaurantId || "").trim();
+  if (!targetId) return false;
+  let currentId = "";
+  try { currentId = String(sessionStorage.getItem("restaurant_current_id") || "").trim(); } catch { /* ignore */ }
+  return Boolean(currentId) && currentId !== targetId;
+}
+
+function showForegroundNotification(payload = {}) {
+  if (!isRecord(payload)) {
+    pushDebugWarn(PUSH_DEBUG_PREFIX, "Ignoring malformed foreground notification payload", { payload });
+    return;
+  }
+  if (isPushForOtherRestaurant(payload)) {
+    pushDebugLog(PUSH_DEBUG_PREFIX, "Dropped foreground push for another restaurant", { payload });
+    return;
+  }
+  const notificationKey = getNotificationKey(payload);
+  pushDebugLog(PUSH_DEBUG_PREFIX, "showForegroundNotification received", { notificationKey, payload });
+  if (wasRecentlyHandled(notificationKey)) {
+    return;
+  }
+
+  const title =
+    payload?.notification?.title ||
+    payload?.data?.title ||
+    "New notification";
+  const body =
+    payload?.notification?.body ||
+    payload?.data?.body ||
+    "";
+  const image =
+    payload?.notification?.image ||
+    payload?.notification?.imageUrl ||
+    payload?.data?.image ||
+    payload?.data?.imageUrl ||
+    undefined;
+
+  playPushSound(payload);
+
+      // Status updates must not make the OS notification sound.
+      const allowOsSound = isPushRingEvent(payload);
+
+      // Force system notification even when the tab is in focus
+      const resolveClickTarget = () => {
+        const defaultLink = normalizeModuleFromPath() === 'delivery' || payload?.data?.type === 'new_order' || payload?.data?.role === 'delivery' ? '/food/delivery/feed' : '/food/restaurant';
+        const link = payload?.data?.targetUrl || payload?.data?.link || defaultLink;
+        return link.startsWith("/restaurant") ? `/food${link}` : link;
+      };
+
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        try {
+          pushDebugLog(PUSH_DEBUG_PREFIX, "Showing browser notification from page", {
+            title,
+            body,
+            image,
+            notificationKey,
+          });
+          // Use service worker to show native system notification to ensure it bypasses focus checks
+          if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.getRegistration().then(registration => {
+              if (registration) {
+                registration.showNotification(title, {
+                  body,
+                  icon: "/eqosy-logo.png",
+                  image,
+                  tag: notificationKey || undefined,
+                  data: payload?.data || {},
+                  requireInteraction: allowOsSound,
+                  silent: !allowOsSound,
+                  ...(allowOsSound ? { vibrate: [200, 100, 200, 100, 300] } : {}),
+                });
+              } else {
+                const notif = new Notification(title, {
+                  body,
+                  icon: "/eqosy-logo.png",
+                  image,
+                  tag: notificationKey || undefined,
+                  requireInteraction: allowOsSound,
+                  silent: !allowOsSound
+                });
+                notif.onclick = (event) => {
+                  event.preventDefault();
+                  window.focus();
+                  window.location.href = resolveClickTarget();
+                };
+              }
+            }).catch(() => {
+              const notif = new Notification(title, {
+                body,
+                icon: "/eqosy-logo.png",
+                image,
+                tag: notificationKey || undefined,
+                requireInteraction: allowOsSound,
+                silent: !allowOsSound
+              });
+              notif.onclick = (event) => {
+                event.preventDefault();
+                window.focus();
+                window.location.href = resolveClickTarget();
+              };
+            });
+          } else {
+            const notif = new Notification(title, {
+              body,
+              icon: "/eqosy-logo.png",
+              image,
+              tag: notificationKey || undefined,
+              silent: !allowOsSound,
+            });
+            notif.onclick = (event) => {
+              event.preventDefault();
+              window.focus();
+              window.location.href = resolveClickTarget();
+            };
+          }
+        } catch (error) {
+          pushDebugWarn(PUSH_DEBUG_PREFIX, "Browser notification creation failed", {
+            error: error?.message || error,
+          });
+        }
+      }
+
+  // Still show in-app toast for immediate context if we are in focus
+  if (typeof document !== "undefined" && document.visibilityState === "visible") {
+    if (body) {
+      toast.success(`${title}: ${body}`);
+    } else {
+      toast.success(title);
+    }
+  }
+
+  // Persist notification for Admin module dropdown panel
+  if (typeof window !== "undefined" && normalizeModuleFromPath() === "admin") {
+    try {
+      const notifId =
+        payload?.data?.id ||
+        payload?.data?.notificationId ||
+        payload?.messageId ||
+        `fcm-admin-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+      const targetCategory = payload?.data?.category || payload?.data?.type || "general";
+      const targetType = payload?.data?.type || (targetCategory.includes("approval") || targetCategory.includes("handover") ? "approval" : "info");
+
+      const item = {
+        id: String(notifId),
+        title: title || "New Notification",
+        message: body || "",
+        type: targetType,
+        category: targetCategory,
+        path: payload?.data?.targetUrl || payload?.data?.link || payload?.data?.path || "/admin/food",
+        createdAt: payload?.data?.createdAt || new Date().toISOString(),
+        timeLabel: "Just now",
+        metaLabel: [title, body].filter(Boolean).join(" • ") || "Admin Notification",
+      };
+
+      const rawRealtime = localStorage.getItem("admin_realtime_notifications_v1");
+      let currentRealtime = [];
+      try {
+        currentRealtime = rawRealtime ? JSON.parse(rawRealtime) : [];
+      } catch {}
+
+      const rawDismissed = localStorage.getItem("admin_notifications_dismissed_v1");
+      let currentDismissed = [];
+      try {
+        currentDismissed = rawDismissed ? JSON.parse(rawDismissed) : [];
+      } catch {}
+
+      if (!currentDismissed.includes(item.id)) {
+        const uniqueItems = [item, ...currentRealtime.filter((i) => i?.id !== item.id)].slice(0, 100);
+        localStorage.setItem("admin_realtime_notifications_v1", JSON.stringify(uniqueItems));
+        window.dispatchEvent(new Event("adminNotificationsUpdated"));
+      }
+    } catch (e) {
+      pushDebugWarn(PUSH_DEBUG_PREFIX, "Failed to persist FCM admin notification", { error: e?.message });
+    }
+  }
+}
+
+function attachServiceWorkerMessageListener() {
+  if (serviceWorkerMessageListenerAttached || typeof window === "undefined") {
+    return;
+  }
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.addEventListener("message", (event) => {
+      const data = isRecord(event?.data) ? event.data : null;
+      if (!data || data.type !== "push-notification-received") return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        pushDebugLog(PUSH_DEBUG_PREFIX, "Skipping page notification render for SW relay because tab is hidden");
+        return;
+      }
+      if (!isRecord(data.payload)) {
+        pushDebugWarn(PUSH_DEBUG_PREFIX, "Ignoring malformed SW push relay payload", { payload: data.payload });
+        return;
+      }
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Received service worker message in page", { payload: data.payload });
+      scheduleForegroundNotification(data.payload);
+    });
+  }
+
+  window.addEventListener("native-push-notification", (event) => {
+    const payload = isRecord(event?.detail) ? event.detail : null;
+    if (!payload) {
+      pushDebugWarn(PUSH_DEBUG_PREFIX, "Ignoring malformed native push event", { payload: event?.detail });
+      return;
+    }
+    pushDebugLog(PUSH_DEBUG_PREFIX, "Received native push event", { payload });
+    scheduleForegroundNotification(payload);
+  });
+
+  window.addEventListener("message", (event) => {
+    const data = isRecord(event?.data) ? event.data : null;
+    if (!data) return;
+    if (data.type !== "native-push-notification") return;
+    if (!isRecord(data.payload)) {
+      pushDebugWarn(PUSH_DEBUG_PREFIX, "Ignoring malformed native postMessage payload", { payload: data.payload });
+      return;
+    }
+    pushDebugLog(PUSH_DEBUG_PREFIX, "Received native postMessage push event", { payload: data.payload });
+    scheduleForegroundNotification(data.payload);
+  });
+
+  serviceWorkerMessageListenerAttached = true;
+}
+
+function scheduleForegroundNotification(payload) {
+  // Let the delivery app pull the order card even when its socket missed the event (mobile background).
+  try {
+    window.dispatchEvent(new CustomEvent("delivery-push-received", { detail: payload }));
+  } catch {
+    // ignore
+  }
+  // Keep message handlers fast to avoid Chrome [Violation] warnings.
+  // Defer heavier work (toast, audio) to idle time / next tick.
+  const run = () => showForegroundNotification(payload);
+  try {
+    if (typeof window !== "undefined" && typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(run, { timeout: 1000 });
+      return;
+    }
+  } catch {
+    // ignore
+  }
+  setTimeout(run, 0);
+}
+
+export function initPushNotificationClient() {
+  if (typeof window === "undefined") return;
+  const moduleName = normalizeModuleFromPath(window.location.pathname);
+  pushDebugLog(PUSH_DEBUG_PREFIX, "Initializing push notification client", {
+    path: window.location.pathname,
+    moduleName,
+    soundEnabled: isPushSoundEnabled(),
+  });
+
+  if (isPushSoundEnabled()) {
+    pushSoundUnlocked = true;
+  }
+
+  setupPushSoundUnlock();
+  attachServiceWorkerMessageListener();
+}
+
+async function attachForegroundListener(firebaseAppInstance) {
+  if (foregroundListenerAttached) return;
+
+  const { getMessaging, onMessage, isSupported } = await import("firebase/messaging");
+  const supported = await isSupported().catch(() => false);
+  if (!supported) return;
+
+  const messaging = getMessaging(firebaseAppInstance);
+  setupPushSoundUnlock();
+  attachServiceWorkerMessageListener();
+
+  onMessage(messaging, (payload) => {
+    pushDebugLog(PUSH_DEBUG_PREFIX, "Received Firebase foreground message", { payload });
+    scheduleForegroundNotification(payload);
+  });
+
+  foregroundListenerAttached = true;
+}
+
+export async function registerWebPushForCurrentModule(pathname = window.location.pathname) {
+  const moduleName = normalizeModuleFromPath(pathname);
+  initPushNotificationClient();
+
+  const accessToken = localStorage.getItem(`${moduleName}_accessToken`);
+  if (!accessToken) return;
+
+  // Flutter wrappers must always store their native token as mobile, even when
+  // the embedded WebView happens to expose browser push APIs.
+  if (isFlutterWebView()) {
+    await registerNativeWebViewFcmToken(moduleName);
+    return null;
+  }
+
+  const supportsBrowserPush = isSupportedBrowser() && isSecureContextForPush();
+
+  if (supportsBrowserPush) {
+    if (registrationInFlight) return registrationInFlight;
+
+    registrationInFlight = (async () => {
+      const firebasePublicEnv = await getFirebasePublicEnv();
+      if (!firebasePublicEnv?.vapidKey) {
+        console.warn("FCM web registration skipped: FIREBASE_VAPID_KEY is missing in env setup.");
+        return;
+      }
+
+      const app = getMessagingFirebaseApp(firebasePublicEnv);
+      if (!app) {
+        console.warn("FCM web registration skipped: Firebase public web config is incomplete.");
+        return;
+      }
+
+      const permission =
+        Notification.permission === "default"
+          ? await Notification.requestPermission()
+          : Notification.permission;
+
+      if (permission !== "granted") {
+        console.warn("FCM web registration skipped: Notification permission not granted.", permission);
+        return;
+      }
+
+      const { getMessaging, getToken, isSupported } = await import("firebase/messaging");
+      const supported = await isSupported().catch(() => false);
+      if (!supported) return;
+
+      const registration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+      pushDebugLog(PUSH_DEBUG_PREFIX, "Service worker registered for push", {
+        scope: registration.scope,
+        moduleName,
+      });
+      const messaging = getMessaging(app);
+
+      let token = null;
+      try {
+        token = await getToken(messaging, {
+          vapidKey: firebasePublicEnv.vapidKey,
+          serviceWorkerRegistration: registration,
+        });
+      } catch (fcmErr) {
+        pushDebugWarn(PUSH_DEBUG_PREFIX, "FCM Web Push token generation failed (403 Forbidden or VAPID key mismatch)", {
+          error: fcmErr?.message || fcmErr,
+        });
+        return;
+      }
+
+      if (!token) return;
+      pushDebugLog(PUSH_DEBUG_PREFIX, "FCM token resolved", {
+        moduleName,
+      });
+
+      // Removed localStorage caching (getSavedToken/setSavedToken) as per user requirements.
+      // The backend 'upsert' already handles duplicates efficiently.
+      try {
+        pushDebugLog(PUSH_DEBUG_PREFIX, "Synchronizing FCM token with backend database", { moduleName });
+        await saveTokenByModule(moduleName, token);
+        pushDebugLog(PUSH_DEBUG_PREFIX, "FCM token synchronized with backend successfully");
+      } catch (e) {
+        pushDebugWarn(PUSH_DEBUG_PREFIX, "Failed to synchronize FCM token to backend", { error: e?.message || e, stack: e?.stack });
+      }
+
+      await attachForegroundListener(app);
+    })()
+      .catch((e) => {
+        console.error("FCM web registration failed:", e);
+      })
+      .finally(() => {
+        registrationInFlight = null;
+      });
+
+    return registrationInFlight;
+  }
+
+  return null;
+}

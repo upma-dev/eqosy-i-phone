@@ -4,7 +4,7 @@ import fs from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const FRONTEND = path.resolve(here, '../Eqosy/Frontend');
+const FRONTEND = path.resolve(here, 'Eqosy/Frontend');
 const appId = process.env.IOS_APP || 'user';
 const apps = JSON.parse(fs.readFileSync(path.join(here, 'apps.json'), 'utf8'));
 const app = apps[appId];

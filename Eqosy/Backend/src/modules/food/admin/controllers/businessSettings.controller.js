@@ -1,0 +1,119 @@
+import { FoodBusinessSettings } from '../models/businessSettings.model.js';
+import { sendResponse } from '../../../../utils/response.js';
+import { uploadImageBufferDetailed } from '../../../../services/cloudinary.service.js';
+
+export async function getBusinessSettings(req, res, next) {
+    try {
+        let settings = await FoodBusinessSettings.findOne().lean();
+        if (!settings) {
+            // Create default settings if none exist
+            settings = await FoodBusinessSettings.create({
+                companyName: 'Eqosy',
+                email: 'admin@eqosy.com'
+            });
+        }
+        return sendResponse(res, 200, 'Business settings fetched successfully', settings);
+    } catch (error) {
+        return sendResponse(res, 200, 'Business settings fetched successfully', {
+            companyName: 'Eqosy',
+            email: 'admin@eqosy.com',
+            phone: { countryCode: '+91', number: '' }
+        });
+    }
+}
+
+export async function updateBusinessSettings(req, res, next) {
+    try {
+        const data = req.body.data ? JSON.parse(req.body.data) : {};
+        const { companyName, email, phoneCountryCode, phoneNumber, address, state, pincode, region } = data;
+
+        // Validate only the fields that were sent, so a color-only save from Global Settings works.
+        if (companyName !== undefined && (!companyName || companyName.trim().length < 2 || companyName.trim().length > 50)) {
+            return res.status(400).json({ success: false, message: 'Company name must be between 2 and 50 characters' });
+        }
+        if (email !== undefined && (!email || email.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))) {
+            return res.status(400).json({ success: false, message: 'Invalid email address (max 100 characters)' });
+        }
+        if (phoneNumber !== undefined && (!phoneNumber || !/^\d{7,15}$/.test(phoneNumber.trim()))) {
+            return res.status(400).json({ success: false, message: 'Invalid phone number (7-15 digits required)' });
+        }
+        if (address && address.length > 250) {
+            return res.status(400).json({ success: false, message: 'Address is too long (max 250 characters)' });
+        }
+        if (state && state.length > 50) {
+            return res.status(400).json({ success: false, message: 'State name is too long (max 50 characters)' });
+        }
+        if (pincode && !/^\d{4,10}$/.test(pincode.trim())) {
+            return res.status(400).json({ success: false, message: 'Invalid pincode (4-10 digits required)' });
+        }
+
+        let settings = await FoodBusinessSettings.findOne();
+        if (!settings) {
+            settings = new FoodBusinessSettings();
+        }
+
+        if (companyName) settings.companyName = companyName;
+        if (email) settings.email = email;
+        if (phoneCountryCode || phoneNumber) {
+            settings.phone = {
+                countryCode: phoneCountryCode || settings.phone?.countryCode || '+91',
+                number: phoneNumber || settings.phone?.number || ''
+            };
+        }
+        if (address !== undefined) settings.address = address;
+        if (state !== undefined) settings.state = state;
+        if (pincode !== undefined) settings.pincode = pincode;
+        if (region) settings.region = region;
+
+        const hexColor = /^#([0-9a-fA-F]{6})$/;
+        for (const key of ['themeColor', 'landingThemeColor', 'sidebarTextColor']) {
+            if (data[key] === undefined) continue;
+            const value = String(data[key] || '').trim();
+            if (value && !hexColor.test(value)) {
+                return res.status(400).json({ success: false, message: `Invalid color for ${key} (use #RRGGBB)` });
+            }
+            settings[key] = value;
+        }
+
+        if (data.appColors && typeof data.appColors === 'object') {
+            const appKeys = ['admin', 'user', 'delivery', 'restaurant', 'taxiUser', 'taxiDriver'];
+            const next = {};
+            for (const key of appKeys) {
+                const entry = data.appColors[key];
+                if (!entry) continue;
+                const primary = String(entry.primary || '').trim();
+                const secondary = String(entry.secondary || '').trim();
+                if ((primary && !hexColor.test(primary)) || (secondary && !hexColor.test(secondary))) {
+                    return res.status(400).json({ success: false, message: `Invalid color for ${key} (use #RRGGBB)` });
+                }
+                next[key] = { primary, secondary };
+            }
+            settings.appColors = next;
+            settings.markModified('appColors');
+        }
+
+        // Handle file uploads
+        if (req.files) {
+            if (req.files.logo) {
+                const logoResult = await uploadImageBufferDetailed(req.files.logo[0].buffer, 'business/logos');
+                settings.logo = {
+                    url: logoResult.secure_url,
+                    publicId: logoResult.public_id
+                };
+            }
+            if (req.files.favicon) {
+                const faviconResult = await uploadImageBufferDetailed(req.files.favicon[0].buffer, 'business/favicons');
+                settings.favicon = {
+                    url: faviconResult.secure_url,
+                    publicId: faviconResult.public_id
+                };
+            }
+        }
+
+        await settings.save();
+        return sendResponse(res, 200, 'Business settings updated successfully', settings);
+    } catch (error) {
+        next(error);
+    }
+}
+

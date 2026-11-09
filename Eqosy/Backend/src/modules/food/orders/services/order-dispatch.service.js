@@ -1,0 +1,668 @@
+import mongoose from 'mongoose';
+import { FoodOrder, FoodSettings } from '../models/order.model.js';
+import { FoodRestaurant } from '../../restaurant/models/restaurant.model.js';
+import { FoodDeliveryPartner } from '../../delivery/models/deliveryPartner.model.js';
+import { FoodDeliveryCashDeposit } from '../../delivery/models/foodDeliveryCashDeposit.model.js';
+import { getDeliveryCashLimitSettings } from '../../admin/services/admin.service.js';
+import { ValidationError, NotFoundError } from '../../../../core/auth/errors.js';
+import { logger } from '../../../../utils/logger.js';
+import { config } from '../../../../config/env.js';
+import { getIO, rooms } from '../../../../config/socket.js';
+import { addOrderJob } from '../../../../queues/producers/order.producer.js';
+import {
+  buildDeliverySocketPayload,
+  buildOrderIdentityFilter,
+  haversineKm,
+  exceedsVehicleTripLimit,
+  notifyOwnerSafely,
+  notifyOwnersSafely,
+  notifyAdminsSafely,
+  validateOrderDeliveryInfo,
+} from './order.helpers.js';
+
+import { FoodZone } from '../../admin/models/zone.model.js';
+
+/**
+ * Schedule a dispatch retry job — uses BullMQ queue if available,
+ * falls back to in-process setTimeout when Redis/BullMQ is disabled.
+ * This ensures dispatch retries ALWAYS fire even without Redis.
+ */
+async function scheduleDispatchRetry(data, delayMs = 30000) {
+  try {
+    const job = await addOrderJob(data, { delay: delayMs });
+    if (job) return; // BullMQ handled it
+  } catch (queueErr) {
+    logger.warn(`[Dispatch] BullMQ job failed, using setTimeout fallback: ${queueErr?.message}`);
+  }
+
+  // Fallback: in-process timer (no Redis required)
+  logger.info(`[Dispatch] Scheduling in-process dispatch retry in ${delayMs}ms for order ${data?.orderMongoId || data?.orderId}`);
+  setTimeout(async () => {
+    try {
+      const { tryAutoAssign, processDispatchTimeout } = await import('./order.service.js');
+      if (data.action === 'DISPATCH_TIMEOUT_CHECK' && data.partnerId) {
+        await processDispatchTimeout(data.orderMongoId || data.orderId, data.partnerId);
+      } else {
+        await tryAutoAssign(data.orderMongoId || data.orderId, { attempt: data.attempt || 1 });
+      }
+    } catch (err) {
+      logger.warn(`[Dispatch] In-process retry failed: ${err?.message}`);
+    }
+  }, delayMs);
+}
+
+
+function isPointInPolygon(lat, lng, polygon = []) {
+  if (!Array.isArray(polygon) || polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = Number(polygon[i]?.longitude ?? polygon[i]?.lng ?? polygon[i]?.[0]);
+    const yi = Number(polygon[i]?.latitude ?? polygon[i]?.lat ?? polygon[i]?.[1]);
+    const xj = Number(polygon[j]?.longitude ?? polygon[j]?.lng ?? polygon[j]?.[0]);
+    const yj = Number(polygon[j]?.latitude ?? polygon[j]?.lat ?? polygon[j]?.[1]);
+    const intersects =
+      yi > lat !== yj > lat &&
+      lng < ((xj - xi) * (lat - yi)) / ((yj - yi) || Number.EPSILON) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+export function isPartnerInActiveZoneSync(lat, lng, targetZoneId, activeZones = []) {
+  if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) {
+    return false;
+  }
+
+  if (!activeZones || activeZones.length === 0) {
+    return true;
+  }
+
+  if (targetZoneId && mongoose.Types.ObjectId.isValid(targetZoneId)) {
+    const targetZone = activeZones.find(z => z._id.toString() === targetZoneId.toString());
+    if (targetZone && Array.isArray(targetZone.coordinates) && targetZone.coordinates.length >= 3) {
+      return isPointInPolygon(Number(lat), Number(lng), targetZone.coordinates);
+    }
+  }
+
+  return activeZones.some(z => isPointInPolygon(Number(lat), Number(lng), z.coordinates || []));
+}
+
+/** Zone a lat/lng falls in (null when outside every active zone). */
+export function resolveZoneIdForPoint(lat, lng, activeZones = []) {
+  if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return null;
+  const hit = (activeZones || []).find((z) => isPointInPolygon(Number(lat), Number(lng), z.coordinates || []));
+  return hit?._id ? String(hit._id) : null;
+}
+
+/** Restaurant's zone: explicit zoneId when it is an active zone, otherwise derived from its location. */
+export function resolveRestaurantZoneId(restaurant, activeZones = []) {
+  const explicit = restaurant?.zoneId || restaurant?.zone;
+  if (explicit && (activeZones || []).some((z) => String(z._id) === String(explicit))) return String(explicit);
+  const coords = restaurant?.location?.coordinates;
+  if (Array.isArray(coords) && coords.length >= 2) return resolveZoneIdForPoint(coords[1], coords[0], activeZones);
+  return null;
+}
+
+/**
+ * Strict zone membership: a rider belongs to the zone only if their profile zone matches
+ * or their last GPS fix is inside that zone's polygon. Unknown riders are NOT assumed to be in zone.
+ */
+export function isPartnerInZoneStrict(partner, targetZoneId, activeZones = []) {
+  if (!targetZoneId) return true; // zone could not be determined — nothing to restrict on
+  if (partner?.zoneId && String(partner.zoneId) === String(targetZoneId)) return true;
+  const zone = (activeZones || []).find((z) => String(z._id) === String(targetZoneId));
+  if (!zone) return true;
+  if (partner?.lastLat == null || partner?.lastLng == null) return false;
+  return isPointInPolygon(Number(partner.lastLat), Number(partner.lastLng), zone.coordinates || []);
+}
+
+async function listNearbyOnlineDeliveryPartners(
+  restaurantId,
+  { maxKm = 15, limit = 25, orderDeliveryDistance = 0 } = {},
+) {
+  const rId = (restaurantId?._id || restaurantId).toString();
+  const restaurant = await FoodRestaurant.findById(rId)
+    .select("location zoneId zone")
+    .lean();
+
+  const activeZones = await FoodZone.find({ isActive: true }).select("_id coordinates").lean();
+  const targetZoneId = resolveRestaurantZoneId(restaurant, activeZones);
+
+  const dispatchSettings = await getDispatchSettings();
+  // A 0/blank limit would reject every order for that vehicle, so fall back to the defaults.
+
+  let allOnline = await FoodDeliveryPartner.find({
+    availabilityStatus: "online",
+  })
+    .select("_id status lastLat lastLng lastLocationAt name zoneId vehicleType")
+    .lean();
+
+  allOnline = allOnline.filter(p => !p.status || p.status === 'approved' || p.status === 'pending');
+
+  // Do NOT filter out online partners whose GPS location is off or stale —
+  // Requirement: immediate notifications and order requests MUST still be sent to online delivery partners even if location is OFF.
+  logger.info(`[DeliveryDispatch] Found ${allOnline.length} online partner(s) before location/gig filtering.`);
+
+  // Filter: Only dispatch to partners with a valid active gig booking for TODAY's time window (if gig filter is active).
+  // This prevents partners who logged out or have no gig from receiving orders.
+  if (allOnline.length > 0) {
+    try {
+      const { FoodGigBooking } = await import('../../delivery/models/foodGigBooking.model.js');
+      const { FoodGig } = await import('../../delivery/models/foodGig.model.js');
+      const THIRTY_MIN_MS = 30 * 60 * 1000;
+      const now = new Date();
+      const nowMs = now.getTime();
+      const todayStr = now.toISOString().slice(0, 10);
+
+      const partnerObjectIds = allOnline
+        .map(p => mongoose.Types.ObjectId.isValid(p._id) ? new mongoose.Types.ObjectId(p._id) : null)
+        .filter(Boolean);
+
+      // Find all bookings for today where gig time window is active (±30 min grace)
+      const activeGigBookings = await FoodGigBooking.find({
+        deliveryPartnerId: { $in: partnerObjectIds },
+        status: { $in: ['booked', 'completed'] }
+      }).populate({
+        path: 'gigId',
+        select: 'startDateTime endDateTime status date'
+      }).lean();
+
+      // Build set of partnerIds who have an active gig right now
+      const partnersWithActiveGig = new Set();
+      for (const booking of activeGigBookings) {
+        if (!booking.gigId || booking.gigId.status !== 'active') continue;
+        // Only consider gigs for today
+        if (booking.gigId.date && booking.gigId.date !== todayStr) continue;
+        const startMs = new Date(booking.gigId.startDateTime).getTime();
+        const endMs = new Date(booking.gigId.endDateTime).getTime();
+        const isInWindow = (nowMs >= startMs - THIRTY_MIN_MS) && (nowMs <= endMs);
+        if (isInWindow) {
+          partnersWithActiveGig.add(String(booking.deliveryPartnerId));
+        }
+      }
+
+      // Also allow partners who have an active order in progress (even if gig expired)
+      const { FoodOrder } = await import('../models/order.model.js');
+      const activeOrderDocs = await FoodOrder.find({
+        'dispatch.deliveryPartnerId': { $in: partnerObjectIds },
+        orderStatus: { $in: ['confirmed', 'preparing', 'ready_for_pickup', 'reached_pickup', 'picked_up', 'reached_drop'] }
+      }).select('dispatch.deliveryPartnerId').lean();
+      for (const od of activeOrderDocs) {
+        partnersWithActiveGig.add(String(od.dispatch?.deliveryPartnerId));
+      }
+
+      if (partnersWithActiveGig.size > 0) {
+        const gigPartners = allOnline.filter(p => partnersWithActiveGig.has(String(p._id)));
+        // Never leave an order with nobody to offer it to: if no ONLINE partner has a gig, keep all online partners.
+        if (gigPartners.length > 0) {
+          allOnline = gigPartners;
+        } else {
+          logger.warn('[DeliveryDispatch] No online partner has an active gig; offering to all online partners instead.');
+        }
+      }
+      logger.info(`[DeliveryDispatch] Gig filter: ${allOnline.length} partner(s) available for order assignment.`);
+    } catch (gigErr) {
+      logger.warn(`[DeliveryDispatch] Gig validity check failed (skipping filter): ${gigErr.message}`);
+    }
+  }
+
+  // Orders go ONLY to riders of the restaurant's zone (e.g. Indore restaurant -> Indore riders).
+  const isPartnerInTargetZone = (p) => isPartnerInZoneStrict(p, targetZoneId, activeZones);
+
+  if (!restaurant?.location?.coordinates?.length) {
+    const partners = allOnline.filter((p) => isPartnerInTargetZone(p));
+
+    return {
+      restaurant: null,
+      partners: partners.slice(0, limit).map((p) => ({ partnerId: p._id, distanceKm: null, status: p.status })),
+    };
+  }
+
+  const [rLng, rLat] = restaurant.location.coordinates;
+
+  // Score all online partners with distance and zone membership
+  const scored = [];
+  for (const p of allOnline) {
+    const inZone = isPartnerInTargetZone(p);
+
+    let d = 999;
+    if (p.lastLat != null && p.lastLng != null) {
+      const calcD = haversineKm(rLat, rLng, p.lastLat, p.lastLng);
+      if (Number.isFinite(calcD)) d = calcD;
+    }
+
+    // Vehicle distance limits. A stale GPS fix (e.g. from signup or an old session) says nothing
+    // about where the rider is now, so only count the pickup leg when the location is recent.
+    const locationAgeMs = p.lastLocationAt ? Date.now() - new Date(p.lastLocationAt).getTime() : Infinity;
+    const hasFreshLocation = d !== 999 && locationAgeMs <= 15 * 60 * 1000;
+    if (exceedsVehicleTripLimit(p.vehicleType, { deliveryKm: orderDeliveryDistance, pickupKm: hasFreshLocation ? d : 0 }, dispatchSettings)) continue;
+
+    scored.push({ partnerId: p._id, distanceKm: Number.isFinite(d) ? d : 999, status: p.status, isInZone: inZone });
+  }
+
+  let picked;
+  if (targetZoneId) {
+    // Restaurant zone is known: strictly its zone riders, closest first. No fallback to other zones;
+    // if nobody is available the dispatch retry loop / admin alert handles it.
+    const zonePartners = scored.filter(p => p.isInZone);
+    zonePartners.sort((a, b) => a.distanceKm - b.distanceKm);
+    picked = zonePartners.slice(0, Math.max(1, limit));
+    logger.info(`[DeliveryDispatch] ${zonePartners.length} delivery partner(s) in restaurant zone ${targetZoneId}.`);
+  } else {
+    // Zone cannot be determined (no zones configured / restaurant outside all zones): distance based.
+    const distancePartners = scored.filter(p => p.distanceKm <= maxKm || p.distanceKm === 999);
+    distancePartners.sort((a, b) => a.distanceKm - b.distanceKm);
+    picked = distancePartners.slice(0, Math.max(1, limit));
+  }
+
+  return { partners: picked };
+}
+
+async function filterPartnersByCodCashLimit(partners = [], order = null) {
+  if (!Array.isArray(partners) || partners.length === 0) return [];
+
+  const paymentMethod = String(order?.payment?.method || '').trim().toLowerCase();
+  if (paymentMethod !== 'cash') {
+    return partners;
+  }
+
+  const cashLimitSettings = await getDeliveryCashLimitSettings();
+  const totalCashLimit = Number(cashLimitSettings?.deliveryCashLimit) || 0;
+  if (totalCashLimit <= 0) {
+    return partners;
+  }
+
+  const orderCashImpact = Math.max(0, Number(order?.pricing?.total) || 0);
+
+  const partnerIds = partners
+    .map((partner) => partner?.partnerId)
+    .filter((partnerId) => mongoose.Types.ObjectId.isValid(partnerId))
+    .map((partnerId) => new mongoose.Types.ObjectId(partnerId));
+
+  if (partnerIds.length === 0) {
+    return partners;
+  }
+
+  const [cashCollectedAgg, cashDepositsAgg] = await Promise.all([
+    FoodOrder.aggregate([
+      {
+        $match: {
+          'dispatch.deliveryPartnerId': { $in: partnerIds },
+          orderStatus: 'delivered',
+          'payment.method': 'cash',
+        },
+      },
+      {
+        $group: {
+          _id: '$dispatch.deliveryPartnerId',
+          cashCollected: { $sum: { $ifNull: ['$pricing.total', 0] } },
+        },
+      },
+    ]),
+    FoodDeliveryCashDeposit.aggregate([
+      {
+        $match: {
+          deliveryPartnerId: { $in: partnerIds },
+          status: 'Completed',
+        },
+      },
+      {
+        $group: {
+          _id: '$deliveryPartnerId',
+          depositedCash: { $sum: { $ifNull: ['$amount', 0] } },
+        },
+      },
+    ]),
+  ]);
+
+  const cashCollectedMap = new Map(
+    (cashCollectedAgg || []).map((entry) => [
+      String(entry?._id || ''),
+      Number(entry?.cashCollected) || 0,
+    ]),
+  );
+  const cashDepositsMap = new Map(
+    (cashDepositsAgg || []).map((entry) => [
+      String(entry?._id || ''),
+      Number(entry?.depositedCash) || 0,
+    ]),
+  );
+
+  const eligiblePartners = partners.filter((partner) => {
+    const partnerId = String(partner?.partnerId || '');
+    const cashCollected = cashCollectedMap.get(partnerId) || 0;
+    const depositedCash = cashDepositsMap.get(partnerId) || 0;
+    const cashInHand = Math.max(0, cashCollected - depositedCash);
+    const projectedCashInHand = cashInHand + orderCashImpact;
+    return projectedCashInHand <= totalCashLimit;
+  });
+
+  const skippedCount = partners.length - eligiblePartners.length;
+  if (skippedCount > 0) {
+    logger.info(
+      `COD cash-limit filter skipped ${skippedCount} delivery partner(s) for order ${order?._id || ''}.`,
+    );
+  }
+
+  if (eligiblePartners.length === 0 && partners.length > 0) {
+    logger.warn(
+      `[DeliveryDispatch] All ${partners.length} online partner(s) exceed COD cash limit for order ${order?._id || ''}. Falling back to available online partners so order is not stuck.`,
+    );
+    return partners;
+  }
+
+  return eligiblePartners;
+}
+
+export async function getDispatchSettings() {
+  const settings = await FoodSettings.findOne({ key: "dispatch" }).lean();
+  return { 
+    dispatchMode: settings?.dispatchMode || "auto",
+    maxDistanceCycle: settings?.maxDistanceCycle ?? 5,
+    maxDistanceElectricScooter: settings?.maxDistanceElectricScooter ?? 8
+  };
+}
+
+export async function updateDispatchSettings(payload, adminId) {
+  // Always set to auto
+  const updateData = {
+    dispatchMode: "auto",
+    updatedBy: { role: "ADMIN", adminId, at: new Date() },
+  };
+  if (payload.maxDistanceCycle !== undefined) updateData.maxDistanceCycle = payload.maxDistanceCycle;
+  if (payload.maxDistanceElectricScooter !== undefined) updateData.maxDistanceElectricScooter = payload.maxDistanceElectricScooter;
+  
+  await FoodSettings.findOneAndUpdate(
+    { key: "dispatch" },
+    { $set: updateData },
+    { upsert: true, new: true },
+  );
+  return getDispatchSettings();
+}
+
+export async function tryAutoAssign(orderId, options = {}) {
+  const attempt = options.attempt || 1;
+  const lockTimeout = 55000; // 55 seconds lock interval
+
+  const order = await FoodOrder.findOneAndUpdate(
+    {
+      _id: new mongoose.Types.ObjectId(orderId),
+      $or: [
+        { 'dispatch.status': 'unassigned' },
+        {
+          'dispatch.status': 'assigned',
+          'dispatch.acceptedAt': { $exists: false },
+          'dispatch.assignedAt': { $lt: new Date(Date.now() - lockTimeout) }
+        }
+      ],
+      $and: [
+        {
+          $or: [
+            { 'dispatch.dispatchingAt': { $exists: false } },
+            { 'dispatch.dispatchingAt': null },
+            { 'dispatch.dispatchingAt': { $lt: new Date(Date.now() - lockTimeout) } }
+          ]
+        }
+      ]
+    },
+    {
+      $set: { 'dispatch.dispatchingAt': new Date() }
+    },
+    { new: true }
+  ).populate(['restaurantId', 'userId']);
+
+  if (!order) {
+    logger.info(`tryAutoAssign: Skip for ${orderId} (already dispatching, accepted, or multi-attempt lock active).`);
+    return null;
+  }
+
+  try {
+    const forceRebroadcast = Boolean(options.forceRebroadcast);
+
+    // Only dispatch once the restaurant has accepted the order (confirmed/preparing or later), unless manual forceRebroadcast
+    const DISPATCHABLE_STATUSES = ['confirmed', 'preparing', 'ready_for_pickup', 'ready', 'reached_pickup', 'picked_up', 'reached_drop'];
+    if (!forceRebroadcast && !DISPATCHABLE_STATUSES.includes(order.orderStatus)) {
+      logger.info(`tryAutoAssign: Skip for ${orderId} (status ${order.orderStatus} not dispatchable yet).`);
+      return order;
+    }
+
+    // Verify complete delivery information (address, customer contact, restaurant location) before searching/notifying riders
+    const deliveryValidation = validateOrderDeliveryInfo(order, order.restaurantId);
+    if (!deliveryValidation.isValid) {
+      logger.error(`[DeliveryDispatch] Cannot dispatch order ${order._id} (${order.order_id || ''}): ${deliveryValidation.reason}`);
+      try {
+        await notifyAdminsSafely({
+          title: 'Order cannot be dispatched',
+          body: `Order #${order.order_id || order._id}: ${deliveryValidation.reason}`,
+          data: { type: 'admin_alert_dispatch_blocked', orderId: order._id.toString() },
+        });
+      } catch (alertErr) {
+        logger.warn(`Dispatch-blocked admin alert failed: ${alertErr.message}`);
+      }
+      return order;
+    }
+
+    const offeredIds = (order.dispatch?.offeredTo || []).map(o => o.partnerId.toString());
+
+    // RADIUS EXPANSION LOGIC
+    // Attempt 1: 15km, Attempt 2: 25km, Attempt 3: 40km, Attempt 4+: 60km
+    let maxKm = 15;
+    if (attempt === 2) maxKm = 25;
+    if (attempt === 3) maxKm = 40;
+    if (attempt >= 4) maxKm = 60;
+
+    let orderDeliveryDistance = 0;
+    const customerCoords = order.deliveryAddress?.location?.coordinates || order.address?.location?.coordinates;
+    if (order.restaurantId?.location?.coordinates && customerCoords) {
+      const [rLng, rLat] = order.restaurantId.location.coordinates;
+      const [cLng, cLat] = customerCoords;
+      orderDeliveryDistance = haversineKm(rLat, rLng, cLat, cLng);
+    }
+
+    const searchOptions = { maxKm, limit: 15, orderDeliveryDistance };
+    const { partners } = await listNearbyOnlineDeliveryPartners(order.restaurantId, searchOptions);
+
+    // TIERED ALERT LOGIC
+    // Phase 2: Broadcast to all (Attempt 3+)
+    // Phase 3: Admin Alert (Attempt 5+ or roughly 5 mins)
+    const isPhase3 = attempt >= 6; // ~6 minutes (60s * 6)
+
+    if (isPhase3) {
+      logger.error(`[CRITICAL] Order ${order._id} unassigned for ${attempt} mins. Triggering Admin Alert (Phase 3).`);
+      // Notify Admin via Push (Web/Mobile)
+      try {
+        await notifyAdminsSafely({
+          title: 'Unassigned Order Crisis!',
+          body: `Order #${order.order_id || order._id} has not been picked up for 5+ minutes. Manual intervention required!`,
+          data: { type: 'admin_alert_unassigned', orderId: order._id.toString() }
+        });
+      } catch (err) {
+        logger.warn(`Admin notification failed: ${err.message}`);
+      }
+    }
+
+    const codEligiblePartners = forceRebroadcast ? partners : await filterPartnersByCodCashLimit(partners, order);
+
+    // Filter to strictly ONLINE delivery partners right now
+    const partnerIdsToVerify = codEligiblePartners.map(p => p.partnerId).filter(Boolean);
+    const onlineDocs = partnerIdsToVerify.length > 0
+      ? await FoodDeliveryPartner.find({
+          _id: { $in: partnerIdsToVerify },
+          availabilityStatus: 'online'
+        }).select('_id').lean()
+      : [];
+    const onlineIdsSet = new Set(onlineDocs.map(d => d._id.toString()));
+
+    const codEligibleOnlinePartners = codEligiblePartners.filter(p => onlineIdsSet.has(p.partnerId?.toString?.()));
+    const excludedPartnerIds = new Set(
+      (order.dispatch?.offeredTo || [])
+        .filter(o => ['rejected', 'handover', 'timeout'].includes(o.action))
+        .map(o => (o.partnerId?.toString?.() || String(o.partnerId)))
+    );
+
+    const eligible = codEligibleOnlinePartners.filter(p => !offeredIds.includes(p.partnerId.toString()));
+
+    // If no eligible partners left
+    if (eligible.length === 0) {
+      let targets = codEligibleOnlinePartners.filter(p => !excludedPartnerIds.has(p.partnerId.toString()));
+      if (targets.length === 0 && forceRebroadcast) {
+        targets = codEligibleOnlinePartners.length > 0 ? codEligibleOnlinePartners : partners;
+      }
+      if (targets.length === 0) {
+        logger.info(`tryAutoAssign: No available online partners for order ${order._id}. Retrying in 15s...`);
+        await scheduleDispatchRetry({
+          action: 'DISPATCH_TIMEOUT_CHECK',
+          orderMongoId: order._id.toString(),
+          orderId: order._id.toString(),
+          attempt: attempt + 1
+        }, 15000);
+        return order;
+      }
+      // Pick closest available partner
+      eligible.push(targets[0]);
+    }
+
+    const targetsToNotify = forceRebroadcast ? (eligible.length > 0 ? eligible : partners) : [eligible[0]];
+    const io = getIO();
+    const payload = buildDeliverySocketPayload(order, order.restaurantId);
+
+    for (const targetPartner of targetsToNotify) {
+      const roundedDistanceKm = Number.isFinite(Number(targetPartner.distanceKm))
+        ? Math.round(Number(targetPartner.distanceKm) * 10) / 10
+        : 0;
+      const formattedDistanceKmStr = roundedDistanceKm.toFixed(1);
+
+      logger.info(`tryAutoAssign: Offering order ${order._id} to partner ${targetPartner.partnerId} (${formattedDistanceKmStr} km).`);
+
+      if (io) {
+        const roomName = rooms.delivery(targetPartner.partnerId);
+        io.to(roomName).emit('new_order', { ...payload, pickupDistanceKm: roundedDistanceKm, forceAlert: true });
+        io.to(roomName).emit('play_notification_sound', { ...payload, pickupDistanceKm: roundedDistanceKm });
+      }
+
+      try {
+        await notifyOwnersSafely(
+          [{ ownerType: 'DELIVERY_PARTNER', ownerId: targetPartner.partnerId }],
+          {
+            title: 'New order request! 🛵',
+            body: `Order #${order.order_id || order.orderId || order._id} is nearby (${formattedDistanceKmStr} km). Accept now!`,
+            data: {
+              type: 'new_order',
+              orderId: order._id.toString(),
+              order_id: order.order_id || order.orderId || order._id.toString(),
+              displayOrderId: order.order_id || order.orderId || order._id.toString(),
+              targetUrl: '/food/delivery/feed',
+              link: '/food/delivery/feed',
+              click_action: '/food/delivery/feed',
+              role: 'delivery',
+            },
+          }
+        );
+      } catch (err) {
+        logger.warn(`Push notification failed for rider ${targetPartner.partnerId}: ${err.message}`);
+      }
+
+      order.dispatch.offeredTo.push({
+        partnerId: targetPartner.partnerId,
+        at: new Date(),
+        action: 'offered'
+      });
+    }
+
+    order.dispatch.status = 'unassigned';
+    order.dispatch.deliveryPartnerId = null;
+    await order.save();
+
+    // Schedule 30-second timeout check for this driver. If they don't accept in 30s, dispatch to the next closest driver!
+    await scheduleDispatchRetry({
+      action: 'DISPATCH_TIMEOUT_CHECK',
+      orderMongoId: order._id.toString(),
+      orderId: order._id.toString(),
+      partnerId: (targetsToNotify[0]?.partnerId || "").toString(),
+      attempt: attempt + 1
+    }, 30000);
+
+    return order;
+  } finally {
+    await FoodOrder.findByIdAndUpdate(orderId, {
+      $unset: { 'dispatch.dispatchingAt': '' },
+    });
+  }
+}
+
+
+export async function processDispatchTimeout(orderId, partnerId) {
+  const order = await FoodOrder.findById(orderId);
+  if (!order) return;
+
+  const stillAssigned = order.dispatch?.status === 'assigned' &&
+    String(order.dispatch?.deliveryPartnerId) === String(partnerId) &&
+    !order.dispatch?.acceptedAt;
+
+  if (stillAssigned) {
+    logger.info(`Dispatch timeout for partner ${partnerId} on order ${orderId}. Re-trying hunt...`);
+    const offer = order.dispatch.offeredTo.find(
+      o => String(o.partnerId) === String(partnerId) && o.action === 'offered'
+    );
+    if (offer) offer.action = 'timeout';
+
+    order.dispatch.status = 'unassigned';
+    order.dispatch.deliveryPartnerId = null;
+    await order.save();
+
+    const attempt = (order.dispatch?.offeredTo?.length || 0) + 1;
+    await tryAutoAssign(orderId, { attempt });
+  } else if (order.dispatch?.status === 'unassigned') {
+    // If it's already unassigned (e.g. from a previous timeout), just keep hunting
+    const attempt = (order.dispatch?.offeredTo?.length || 0) + 1;
+    await tryAutoAssign(orderId, { attempt });
+  }
+}
+
+
+export async function resendDeliveryNotificationRestaurant(orderId, restaurantId) {
+  const identity = buildOrderIdentityFilter(orderId);
+
+  // Try finding order with restaurant filter if provided, or fallback to identity lookup
+  let order = null;
+  if (restaurantId && mongoose.Types.ObjectId.isValid(restaurantId)) {
+    order = await FoodOrder.findOne({
+      ...identity,
+      restaurantId: new mongoose.Types.ObjectId(restaurantId),
+    }).populate(['restaurantId', 'userId']);
+  }
+
+  if (!order) {
+    order = await FoodOrder.findOne({
+      ...identity,
+    }).populate(['restaurantId', 'userId']);
+  }
+
+  if (!order) throw new NotFoundError('Order not found');
+
+  const activeStatuses = ['confirmed', 'preparing', 'ready_for_pickup', 'ready'];
+  if (!activeStatuses.includes(order.orderStatus)) {
+    throw new ValidationError(`Cannot resend notification for order in status: ${order.orderStatus}`);
+  }
+
+  if (order.dispatch?.status === 'accepted') {
+    throw new ValidationError('A delivery partner has already accepted this order.');
+  }
+
+  // Validate complete delivery information before allowing manual resend
+  const deliveryValidation = validateOrderDeliveryInfo(order, order.restaurantId);
+  if (!deliveryValidation.isValid) {
+    throw new ValidationError(`Cannot resend delivery notification: ${deliveryValidation.reason}`);
+  }
+
+  order.dispatch.status = 'unassigned';
+  order.dispatch.deliveryPartnerId = null;
+  order.dispatch.offeredTo = [];
+  await order.save();
+
+  await tryAutoAssign(order._id, { forceRebroadcast: true, attempt: 1 });
+  const finalOrder = await FoodOrder.findById(order._id).select('dispatch.offeredTo').lean();
+  const notifiedCount = finalOrder?.dispatch?.offeredTo?.length || 0;
+  return { success: true, notifiedCount };
+}
+
