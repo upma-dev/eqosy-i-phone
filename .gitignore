@@ -10,3 +10,8 @@ apps/*/android/build
 apps/*/android/app/build
 apps/*/android/local.properties
 apps/*/ios/App/build
+mobile/node_modules
+mobile/.expo
+mobile/android
+mobile/ios
+mobile/.env

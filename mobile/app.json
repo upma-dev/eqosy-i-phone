@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "Eqosy Taxi",
+    "slug": "eqosy-taxi",
+    "scheme": "eqosy",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.eqosy.rider",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Eqosy needs your location to find nearby drivers and set your pickup point.",
+        "NSCameraUsageDescription": "Eqosy needs the camera to upload photos."
+      }
+    },
+    "android": {
+      "package": "com.eqosy.rider",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "POST_NOTIFICATIONS"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      }
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Eqosy needs your location to find nearby drivers."
+        }
+      ],
+      "expo-font",
+      "expo-splash-screen"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "9c04c2a0-914d-4a28-a20b-c971595c700c"
+      }
+    }
+  }
+}

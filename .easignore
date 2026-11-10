@@ -1,0 +1,13 @@
+.git
+/Eqosy
+/apps
+/www
+/.github
+*.log
+README.md
+BACKEND-IOS-PATCH.md
+node_modules
+mobile/node_modules
+mobile/.expo
+mobile/android
+mobile/ios

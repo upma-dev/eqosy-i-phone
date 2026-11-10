@@ -1,0 +1,48 @@
+name: Build native Android (React Native)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [user, driver, delivery, restaurant]
+    env:
+      EXPO_PUBLIC_APP_VARIANT: ${{ matrix.variant }}
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install
+        run: |
+          npm install
+          npx expo install @react-navigation/native @react-navigation/native-stack @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context expo-secure-store expo-location expo-notifications expo-device expo-constants expo-linking react-native-maps @react-native-async-storage/async-storage @expo/vector-icons expo-haptics axios socket.io-client zustand @tanstack/react-query
+
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Build release APK (debug-signed, for testing)
+        env:
+          EXPO_PUBLIC_API_ORIGIN: ${{ secrets.API_ORIGIN }}
+          EXPO_PUBLIC_GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+        working-directory: mobile/android
+        run: chmod +x gradlew && ./gradlew assembleRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eqosy-${{ matrix.variant }}-rn-apk
+          path: mobile/android/app/build/outputs/apk/release/*.apk
